@@ -58,7 +58,7 @@ MACHINE_ID = _gerar_machine_id()
 # Precisa ser bumpada a cada release publicada no GitHub. E ela que o
 # auto-update compara com a tag da release mais recente.
 # ============================================================
-VERSAO = "1.1.2"
+VERSAO = "1.1.3"
 REPO_API_LATEST = "https://api.github.com/repos/lukas913/rnx-agente-varredura/releases/latest"
 NOME_ASSET = "AgenteVarredura.exe"
 
@@ -464,28 +464,63 @@ def verificar_atualizacao():
     # este PID sumir da lista de processos, troca o arquivo e reabre o agente.
     pid = os.getpid()
     bat = exe_atual.parent / "_atualizar.cmd"
+    # O .cmd deixa rastro proprio: ele roda depois que este processo morreu,
+    # entao nao ha como registrar o que aconteceu no log do agente. Sem isso a
+    # troca falhava em silencio e so dava para diagnosticar por eliminacao.
+    log_troca = BASE_DIR / "_logs" / "atualizacao.log"
     # newline="" e obrigatorio: sem ele o Python traduz cada \n para \r\n e o
     # arquivo sai com \r\r\n. O cmd nao aceita — o rotulo vira ":esperar\r", o
     # "goto esperar" nao encontra o destino e o script morre antes de trocar o
     # executavel. Foi exatamente o que aconteceu no primeiro teste: o download
     # completou, o .cmd foi criado, e nada foi substituido.
+    # A pergunta certa nao e "o processo morreu?" e sim "o arquivo ja pode ser
+    # substituido?". Tentar o move em laco responde as duas de uma vez: enquanto
+    # o .exe estiver em uso o Windows recusa, e no instante em que liberar, passa.
+    #
+    # Tres armadilhas do cmd que este formato evita, todas encontradas testando:
+    #   - `timeout` exige console e falha na hora quando o processo nasce sem um,
+    #     transformando a espera em laco infinito. Usamos `ping` para pausar.
+    #   - `goto` dentro de um bloco entre parenteses tem comportamento traicoeiro.
+    #     Aqui nao ha nenhum bloco.
+    #   - depender de `tasklist | find "<pid>"` quebra conforme o idioma do
+    #     Windows, que muda a mensagem de "nenhuma tarefa encontrada".
+    #
+    # Limite de 60 tentativas (~2 min). Se estourar, fica registrado no log em
+    # vez de tentar para sempre.
     bat.write_text(
         "@echo off\r\n"
-        ":esperar\r\n"
-        f'tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul\r\n'
-        "if not errorlevel 1 (\r\n"
-        "  timeout /t 1 /nobreak >nul\r\n"
-        "  goto esperar\r\n"
-        ")\r\n"
-        f'move /y "{novo}" "{exe_atual}" >nul\r\n'
+        f'echo [%date% %time%] iniciado (agente pid {pid}) >> "{log_troca}"\r\n'
+        "set /a tentativas=0\r\n"
+        ":tentar\r\n"
+        "set /a tentativas+=1\r\n"
+        f'move /y "{novo}" "{exe_atual}" >nul 2>&1\r\n'
+        f'if not exist "{novo}" goto pronto\r\n'
+        "if %tentativas% geq 60 goto desistiu\r\n"
+        "ping -n 2 127.0.0.1 >nul\r\n"
+        "goto tentar\r\n"
+        ":pronto\r\n"
+        f'echo [%date% %time%] executavel substituido apos %tentativas% tentativa(s) >> "{log_troca}"\r\n'
         f'start "" "{exe_atual}"\r\n'
-        'del "%~f0"\r\n',
+        f'echo [%date% %time%] agente reiniciado >> "{log_troca}"\r\n'
+        'del "%~f0"\r\n'
+        "exit /b\r\n"
+        ":desistiu\r\n"
+        f'echo [%date% %time%] DESISTI: o executavel seguiu bloqueado apos %tentativas% tentativas >> "{log_troca}"\r\n'
+        "exit /b\r\n",
         encoding="utf-8", newline="")
 
+    # Somente DETACHED_PROCESS. A versao anterior combinava com CREATE_NO_WINDOW
+    # e o Windows nao aceita os dois juntos — sao mutuamente exclusivos, e o
+    # processo simplesmente nao subia. O .cmd ficava no disco intacto e o
+    # executavel nunca era trocado, sem erro nenhum aparecer.
+    # DETACHED_PROCESS ja garante que nao aparece janela: o processo nasce sem
+    # console. E precisa ser destacado mesmo, para sobreviver a saida deste.
     try:
         import subprocess
-        DESTACADO = 0x00000008 | 0x08000000   # DETACHED_PROCESS | CREATE_NO_WINDOW
-        subprocess.Popen(["cmd", "/c", str(bat)], creationflags=DESTACADO, close_fds=True)
+        DETACHED_PROCESS = 0x00000008
+        proc = subprocess.Popen(["cmd", "/c", str(bat)],
+                                creationflags=DETACHED_PROCESS, close_fds=True)
+        logger.info(f"[UPDATE] Script de troca disparado (pid {proc.pid})")
     except Exception as e:
         logger.error(f"[UPDATE] Falha ao disparar a troca: {e}")
         return False
