@@ -58,7 +58,7 @@ MACHINE_ID = _gerar_machine_id()
 # Precisa ser bumpada a cada release publicada no GitHub. E ela que o
 # auto-update compara com a tag da release mais recente.
 # ============================================================
-VERSAO = "1.1.1"
+VERSAO = "1.1.2"
 REPO_API_LATEST = "https://api.github.com/repos/lukas913/rnx-agente-varredura/releases/latest"
 NOME_ASSET = "AgenteVarredura.exe"
 
@@ -464,6 +464,11 @@ def verificar_atualizacao():
     # este PID sumir da lista de processos, troca o arquivo e reabre o agente.
     pid = os.getpid()
     bat = exe_atual.parent / "_atualizar.cmd"
+    # newline="" e obrigatorio: sem ele o Python traduz cada \n para \r\n e o
+    # arquivo sai com \r\r\n. O cmd nao aceita — o rotulo vira ":esperar\r", o
+    # "goto esperar" nao encontra o destino e o script morre antes de trocar o
+    # executavel. Foi exatamente o que aconteceu no primeiro teste: o download
+    # completou, o .cmd foi criado, e nada foi substituido.
     bat.write_text(
         "@echo off\r\n"
         ":esperar\r\n"
@@ -475,7 +480,7 @@ def verificar_atualizacao():
         f'move /y "{novo}" "{exe_atual}" >nul\r\n'
         f'start "" "{exe_atual}"\r\n'
         'del "%~f0"\r\n',
-        encoding="utf-8")
+        encoding="utf-8", newline="")
 
     try:
         import subprocess
