@@ -58,7 +58,7 @@ MACHINE_ID = _gerar_machine_id()
 # Precisa ser bumpada a cada release publicada no GitHub. E ela que o
 # auto-update compara com a tag da release mais recente.
 # ============================================================
-VERSAO = "1.1.3"
+VERSAO = "1.1.4"
 REPO_API_LATEST = "https://api.github.com/repos/lukas913/rnx-agente-varredura/releases/latest"
 NOME_ASSET = "AgenteVarredura.exe"
 
@@ -409,6 +409,18 @@ def _versao_tupla(v):
     return tuple(int(n) for n in nums[:3]) if nums else (0,)
 
 
+def _gravar_config():
+    """Salva o config.json. Falha aqui nunca deve derrubar o agente — em pasta
+    sincronizada o arquivo pode estar momentaneamente travado."""
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(CONFIG, f, indent=4, ensure_ascii=False)
+        return True
+    except Exception as e:
+        logger.warning(f"Nao consegui gravar o config.json: {e}")
+        return False
+
+
 def verificar_atualizacao():
     """Baixa e instala a release mais nova. True = este processo vai encerrar."""
     if not getattr(sys, "frozen", False):
@@ -432,6 +444,22 @@ def verificar_atualizacao():
     tag = info.get("tag_name") or ""
     if _versao_tupla(tag) <= _versao_tupla(VERSAO):
         logger.info(f"[UPDATE] Ja esta na versao mais recente (v{VERSAO})")
+        # Estamos em dia: apaga a marca para nao bloquear a proxima atualizacao.
+        if CONFIG.pop("ultima_tag_instalada", None) is not None:
+            _gravar_config()
+        return False
+
+    # ---- Trava anti-laco ----------------------------------------------------
+    # Se esta tag JA foi instalada e o executavel continua reportando uma versao
+    # menor, entao a release foi publicada sem subir a constante VERSAO no
+    # codigo. Sem esta trava o agente baixaria, trocaria, reiniciaria, veria a
+    # mesma tag e recomecaria — para sempre, com todas as maquinas do escritorio
+    # puxando 58 MB em ciclo.
+    if CONFIG.get("ultima_tag_instalada") == tag:
+        logger.warning(
+            f"[UPDATE] A release {tag} ja foi instalada, mas este executavel reporta "
+            f"v{VERSAO}. Provavel publicacao sem subir a constante VERSAO no agente.py. "
+            f"Ignorando para nao entrar em laco de atualizacao.")
         return False
 
     asset = next((a for a in info.get("assets", []) if a.get("name") == NOME_ASSET), None)
@@ -524,6 +552,11 @@ def verificar_atualizacao():
     except Exception as e:
         logger.error(f"[UPDATE] Falha ao disparar a troca: {e}")
         return False
+
+    # Marca a tag ANTES de sair. Se o proximo boot ainda reportar versao antiga,
+    # a trava la em cima reconhece a situacao e nao repete o download.
+    CONFIG["ultima_tag_instalada"] = tag
+    _gravar_config()
 
     logger.info(f"[UPDATE] Reiniciando na versao {tag}...")
     return True
