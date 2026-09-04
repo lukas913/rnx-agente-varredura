@@ -58,7 +58,7 @@ MACHINE_ID = _gerar_machine_id()
 # Precisa ser bumpada a cada release publicada no GitHub. E ela que o
 # auto-update compara com a tag da release mais recente.
 # ============================================================
-VERSAO = "1.1.0"
+VERSAO = "1.1.1"
 REPO_API_LATEST = "https://api.github.com/repos/lukas913/rnx-agente-varredura/releases/latest"
 NOME_ASSET = "AgenteVarredura.exe"
 
@@ -208,7 +208,11 @@ def _setup_primeiro_run():
             cfg["user_id"] = user.id
             cfg["user_email"] = email
             cfg["user_nome"] = nome_usuario
-            cfg["user_password"] = senha  # salvar para re-auth automática
+            # A senha NAO e guardada. O refresh_token abaixo e rotativo e se
+            # renova a cada uso, entao com o agente rodando ele nunca expira.
+            # Guardar a senha em texto puro no config.json de cada usuario seria
+            # espalhar credencial por todas as maquinas do escritorio.
+            cfg.pop("user_password", None)
             cfg["refresh_token"] = auth_resp.session.refresh_token if auth_resp.session else None
             cfg["pasta_monitorada"] = pasta
             cfg["pasta_processados"] = str(Path(pasta) / "_processados")
@@ -324,7 +328,7 @@ def _reautenticar():
                 status_label.config(text="Senha incorreta", fg="#e74c3c")
                 return
             cfg["refresh_token"] = auth_resp.session.refresh_token
-            cfg["user_password"] = senha  # salvar para re-auth automática
+            cfg.pop("user_password", None)   # nao guardamos mais a senha
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, indent=4, ensure_ascii=False)
             resultado["ok"] = True
@@ -545,6 +549,18 @@ if _refresh_token:
             except Exception:
                 pass
 
+# Limpeza das instalacoes antigas: com a sessao ja autenticada pelo
+# refresh_token, a senha em texto puro nao serve mais para nada e sai do disco.
+# Feito so DEPOIS de autenticar, para nao remover o unico recurso disponivel
+# caso o refresh_token esteja mesmo perdido.
+if _sessao_ok and CONFIG.pop("user_password", None) is not None:
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(CONFIG, f, indent=4, ensure_ascii=False)
+        logger.info("Senha em texto puro removida do config.json — nao e mais necessaria")
+    except Exception as e:
+        logger.warning(f"Nao consegui limpar a senha do config.json: {e}")
+
 if not _sessao_ok:
     logger.warning("⚠ Rodando SEM sessão autenticada — triagem pode falhar (RLS)")
 
@@ -598,12 +614,18 @@ def _tentar_refresh_token():
 
 
 def _tentar_reauth_senha():
-    """Tenta sign_in_with_password usando email/senha do config (último recurso)."""
+    """Ultimo recurso: login por email/senha, se houver senha guardada.
+
+    Desde a v1.1.1 o agente NAO guarda mais a senha, entao este caminho so
+    existe para instalacoes antigas que ainda tenham o campo. O caminho normal
+    e o refresh_token, que rotaciona a cada uso e nao expira com o agente
+    rodando. Se ele morrer de vez, o usuario reabre o agente e loga de novo."""
     global _sessao_ok, _ultimo_refresh, CONFIG
     email = CONFIG.get("user_email")
     senha = CONFIG.get("user_password")
     if not email or not senha:
-        logger.warning("Sem credenciais para re-autenticação automática")
+        logger.warning("Sessao expirada e sem senha guardada — abra o agente e "
+                       "faca login novamente para reativar a sincronizacao")
         _sessao_ok = False
         return False
     try:
@@ -703,14 +725,31 @@ def _carregar_cnpjs_usuario():
             _CNPJS_PERMITIDOS = None
             return
 
-        # Busca vínculos usuario_clientes
-        resp = supabase.table("usuario_clientes").select("cnpj").eq("user_id", USER_ID).execute()
-        if resp.data and len(resp.data) > 0:
-            _CNPJS_PERMITIDOS = {limpar_cnpj(r["cnpj"]) for r in resp.data if r.get("cnpj")}
-        else:
+        # Busca vínculos usuario_clientes.
+        #
+        # A consulta antiga era .select("cnpj").eq("user_id", ...) e devolvia 400:
+        # a tabela nao tem nenhuma dessas duas colunas. As colunas reais sao
+        # usuario_id, cliente_id e setores (conferido no isolamento-dados.js do
+        # RNX, que le a mesma tabela). O 400 caia no except abaixo, que zerava o
+        # filtro — ou seja, o analista processava documento de TODO cliente.
+        #
+        # Sao duas etapas de proposito, usando so colunas confirmadas: depender
+        # de relacionamento embutido (clientes(cnpj)) quebraria de novo caso a
+        # foreign key nao esteja declarada no banco.
+        vinc = supabase.table("usuario_clientes").select("cliente_id").eq("usuario_id", USER_ID).execute()
+        ids = [r["cliente_id"] for r in (vinc.data or []) if r.get("cliente_id")]
+        if not ids:
             # Sem vínculos definidos = sem filtro (mantém retrocompatibilidade)
             _CNPJS_PERMITIDOS = None
-    except Exception:
+            return
+
+        cli = supabase.table("clientes").select("cnpj").in_("id", ids).execute()
+        cnpjs = {limpar_cnpj(r["cnpj"]) for r in (cli.data or []) if r.get("cnpj")}
+        _CNPJS_PERMITIDOS = cnpjs or None
+        logger.info(f"   {len(cnpjs)} cliente(s) vinculado(s) a este usuário")
+    except Exception as e:
+        # Antes esta falha era silenciosa e virava "sem filtro". Agora aparece.
+        logger.warning(f"Nao consegui carregar os clientes vinculados ({e}) — seguindo SEM filtro de CNPJ")
         _CNPJS_PERMITIDOS = None
 
 _carregar_cnpjs_usuario()

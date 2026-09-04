@@ -24,3 +24,6 @@ _limpar_*
 _refresh_token.py
 *.csv
 _agent_std*.log
+
+# Notas de release (rascunho local, nao fazem parte do codigo)
+NOTAS_v*.md
