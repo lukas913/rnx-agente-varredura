@@ -1,0 +1,13 @@
+watchdog>=3.0.0
+pdfplumber>=0.10.0
+supabase>=2.0.0
+pystray>=0.19.0
+Pillow>=10.0.0
+fastapi>=0.115.0
+uvicorn>=0.30.0
+# pymupdf faltava aqui e o agente.py faz `import pymupdf` sem protecao:
+# um ambiente montado so com este arquivo gerava um .exe que morria no boot.
+pymupdf>=1.24.0
+# OCR do proprio Windows, para PDF que e imagem (DESTDA e afins).
+# O codigo trata a ausencia dele, mas sem ele o OCR cai de 0,65s para ~43s.
+winocr>=0.0.12

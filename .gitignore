@@ -1,0 +1,26 @@
+# NUNCA versionar: guarda credenciais do usuario (token de sessao e senha)
+config.json
+
+# Pastas de trabalho do agente (ficam em %LOCALAPPDATA%\RNX-Agente na instalacao)
+_entrada/
+_processados/
+_erro/
+_logs/
+.agente.lock
+
+# Artefatos de build
+build/
+dist/
+__pycache__/
+*.pyc
+*.spec.bak
+
+# Scripts de teste e diagnostico locais
+_test_*
+_check_*
+_debug_*
+_benchmark_*
+_limpar_*
+_refresh_token.py
+*.csv
+_agent_std*.log
