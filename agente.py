@@ -58,7 +58,7 @@ MACHINE_ID = _gerar_machine_id()
 # Precisa ser bumpada a cada release publicada no GitHub. E ela que o
 # auto-update compara com a tag da release mais recente.
 # ============================================================
-VERSAO = "1.1.4"
+VERSAO = "1.1.5"
 REPO_API_LATEST = "https://api.github.com/repos/lukas913/rnx-agente-varredura/releases/latest"
 NOME_ASSET = "AgenteVarredura.exe"
 
@@ -248,32 +248,54 @@ def _setup_primeiro_run():
     return resultado["ok"]
 
 
+def _literal_ps(valor):
+    """Transforma um caminho em literal de string do PowerShell.
+
+    Aspas simples não interpolam nada, então caminho com espaço, $ ou & passa
+    intacto. A versão anterior montava o comando com aspas duplas e caía em
+    qualquer caminho fora do padrão."""
+    return "'" + str(valor).replace("'", "''") + "'"
+
+
 def _registrar_startup():
-    """Registra o agente no Startup do Windows (atalho .lnk)."""
+    """Garante o atalho do agente na pasta Inicializar do Windows.
+
+    Idempotente: se o atalho já aponta para o executável atual, sai sem mexer.
+    O .exe é console=False, então ele sobe sem janela nenhuma."""
     try:
-        import winreg
-        startup_dir = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+        startup_dir = (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows"
+                       / "Start Menu" / "Programs" / "Startup")
+        if not startup_dir.is_dir():
+            logger.warning("[STARTUP] Pasta Inicializar não encontrada; autostart não registrado.")
+            return
+
         vbs_path = BASE_DIR / "iniciar-agente.vbs"
-
-        # Se tiver o .vbs, cria atalho para ele (janela oculta)
-        if vbs_path.exists():
-            target = str(vbs_path)
-        else:
-            # Se for .exe (PyInstaller), cria atalho direto
-            target = str(Path(sys.executable).resolve())
-
-        # Usar PowerShell para criar o .lnk
+        alvo = str(vbs_path if vbs_path.exists() else Path(sys.executable).resolve())
         lnk_path = startup_dir / "Agente Varredura.lnk"
-        ps_cmd = f'''
-$shell = New-Object -ComObject WScript.Shell
-$lnk = $shell.CreateShortcut("{lnk_path}")
-$lnk.TargetPath = "{target}"
-$lnk.WorkingDirectory = "{BASE_DIR}"
-$lnk.Save()
-'''
-        os.system(f'powershell -NoProfile -Command "{ps_cmd.strip()}"')
-    except Exception:
-        pass
+
+        script = (
+            "$ErrorActionPreference='Stop';"
+            "$s=New-Object -ComObject WScript.Shell;"
+            f"$l=$s.CreateShortcut({_literal_ps(lnk_path)});"
+            f"if($l.TargetPath -eq {_literal_ps(alvo)}){{exit 0}};"
+            f"$l.TargetPath={_literal_ps(alvo)};"
+            f"$l.WorkingDirectory={_literal_ps(BASE_DIR)};"
+            "$l.Save();exit 1"
+        )
+        import subprocess
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if r.returncode == 0:
+            logger.info(f"[STARTUP] Atalho já correto: {lnk_path}")
+        elif r.returncode == 1:
+            logger.info(f"[STARTUP] Atalho criado/atualizado: {lnk_path} -> {alvo}")
+        else:
+            logger.warning(f"[STARTUP] PowerShell falhou: {(r.stderr or '').strip()[:200]}")
+    except Exception as e:
+        logger.warning(f"[STARTUP] Não foi possível registrar o autostart: {e}")
 
 
 def _reautenticar():
@@ -564,6 +586,94 @@ def verificar_atualizacao():
 
 logger.info(f"Agente de Varredura v{VERSAO} — maquina {MACHINE_ID}")
 logger.info(f"Pasta de dados: {BASE_DIR}")
+
+
+# ============================================================
+# LOCK DE INSTÂNCIA ÚNICA
+# ============================================================
+# Fica AQUI, e não junto do main(), porque tudo que vem logo abaixo já tem efeito
+# colateral: verificar_atualizacao() pode baixar e trocar o .exe, e a restauração
+# de sessão rotaciona o refresh_token do Supabase. Uma segunda cópia que só
+# descobrisse o lock no main() já teria invalidado o token da primeira, que então
+# para sem deixar erro no log. Foi o que aconteceu em 04/09/2026.
+
+_LOCK_FILE = BASE_DIR / ".agente.lock"
+
+
+def _nome_do_processo(pid):
+    """Nome do executável de um PID, ou None se o processo não existe mais.
+
+    Pergunta ao Windows em vez de ler a saída do `tasklist`. A versão anterior
+    procurava a palavra 'python' nesse texto — que nunca mais apareceu depois que
+    empacotamos como AgenteVarredura.exe. O guarda então concluía sempre "lock
+    stale" e deixava subir uma segunda instância.
+    (O texto do tasklist ainda por cima é traduzido, e esta máquina é pt-BR.)"""
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+    ]
+
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return None
+    try:
+        buf = ctypes.create_unicode_buffer(32768)
+        tam = wintypes.DWORD(len(buf))
+        if not k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(tam)):
+            return None
+        return Path(buf.value).name.lower()
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _liberar_lock():
+    """Remove o lock file ao sair."""
+    try:
+        if _LOCK_FILE.exists() and _LOCK_FILE.read_text().strip() == str(os.getpid()):
+            _LOCK_FILE.unlink()
+    except Exception:
+        pass
+
+
+def _adquirir_lock():
+    """Garante que só uma instância do agente rode por vez.
+
+    Compara o NOME do executável do PID gravado no lock com o nosso: se bate, há
+    uma instância viva de verdade e esta sai. PIDs são reutilizados depois de um
+    reboot, então só checar se o PID existe não basta."""
+    if _LOCK_FILE.exists():
+        try:
+            pid_antigo = int(_LOCK_FILE.read_text().strip())
+        except (ValueError, OSError):
+            pid_antigo = None  # lock corrompido: pode prosseguir
+
+        if pid_antigo and pid_antigo != os.getpid():
+            meu = Path(sys.executable).name.lower()
+            dele = _nome_do_processo(pid_antigo)
+            if dele is None:
+                logger.info(f"PID {pid_antigo} não existe mais. Lock órfão, removendo.")
+            elif dele == meu:
+                logger.warning(f"Outra instância já está rodando (PID {pid_antigo}, {dele}). Saindo.")
+                sys.exit(0)
+            else:
+                logger.info(f"PID {pid_antigo} hoje é {dele}, não o agente. Lock órfão, removendo.")
+
+    _LOCK_FILE.write_text(str(os.getpid()))
+    atexit.register(_liberar_lock)
+    logger.info(f"Lock adquirido (PID {os.getpid()})")
+
+
+# O modo diagnóstico só lista pastas e sai: não pode roubar o lock de um agente
+# que esteja rodando de verdade.
+if "--diagnostico" not in sys.argv and "/diagnostico" not in sys.argv:
+    _adquirir_lock()
+
 if verificar_atualizacao():
     sys.exit(0)
 
@@ -3045,48 +3155,12 @@ def processar_existentes() -> None:
 # ============================================================
 
 
-# ============================================================
-# LOCK DE INSTÂNCIA ÚNICA
-# ============================================================
-
-_LOCK_FILE = BASE_DIR / ".agente.lock"
-
-def _adquirir_lock():
-    """Garante que só uma instância do agente rode por vez.
-    Cria .agente.lock com o PID. Se já existe, verifica se o processo ainda está vivo."""
-    if _LOCK_FILE.exists():
-        try:
-            pid_antigo = int(_LOCK_FILE.read_text().strip())
-            # Verifica se o processo ainda está rodando E é python/pythonw
-            # (PIDs são reutilizados após reboot, então só checar se existe não basta)
-            import subprocess
-            try:
-                result = subprocess.run(
-                    ['tasklist', '/FI', f'PID eq {pid_antigo}', '/FO', 'CSV', '/NH'],
-                    capture_output=True, text=True, timeout=5
-                )
-                output = result.stdout.strip().lower()
-                if 'python' in output:
-                    logger.warning(f"Outra instância já está rodando (PID {pid_antigo}). Saindo.")
-                    sys.exit(0)
-                else:
-                    logger.info(f"PID {pid_antigo} não é python (ou não existe). Lock stale, removendo.")
-            except Exception:
-                logger.info(f"Erro verificando PID {pid_antigo}. Lock stale, removendo.")
-        except (ValueError, OSError):
-            pass  # Lock file inválido, pode prosseguir
-
-    _LOCK_FILE.write_text(str(os.getpid()))
-    atexit.register(_liberar_lock)
-    logger.info(f"Lock adquirido (PID {os.getpid()})")
-
-def _liberar_lock():
-    """Remove o lock file ao sair."""
-    try:
-        if _LOCK_FILE.exists() and _LOCK_FILE.read_text().strip() == str(os.getpid()):
-            _LOCK_FILE.unlink()
-    except Exception:
-        pass
+# O LOCK DE INSTÂNCIA ÚNICA subiu para perto do topo deste arquivo (logo antes
+# de verificar_atualizacao()). Motivo em 08/09/2026: a checagem de atualização e
+# a autenticação rodam no import, muito antes do main(). Com o lock aqui embaixo,
+# uma segunda cópia chegava a autenticar — e a autenticação rotaciona o
+# refresh_token do Supabase — antes de descobrir que devia sair. A primeira
+# instância ficava com um token morto e parava sem registrar erro nenhum.
 
 
 def _scan_documentos_loop():
@@ -3167,7 +3241,15 @@ def main():
         rodar_diagnostico_pastas()
         return
 
-    _adquirir_lock()
+    # O lock já foi adquirido lá em cima, antes da checagem de atualização e da
+    # autenticação — as duas têm efeito colateral e não podem rodar em duplicata.
+
+    # Autostart garantido a cada inicialização, não só na tela de login.
+    # Antes isto dependia de um checkbox que só aparece quando falta token no
+    # config.json. Numa máquina configurada com o config.json já pronto — foi o
+    # caso desta, em 04/09/2026 — o agente subia sem nunca registrar o autostart,
+    # e o primeiro reinício do PC o deixava morto até alguém abrir na mão.
+    _registrar_startup()
 
     logger.info("=" * 60)
     logger.info("AGENTE DE VARREDURA - Iniciando...")
