@@ -13,8 +13,12 @@ a = Analysis(
         'pystray', 'PIL', 'PIL.Image',
         # monitoramento de pasta
         'watchdog', 'watchdog.observers', 'watchdog.observers.polling',
-        # supabase e a pilha dele
-        'supabase', 'httpx', 'gotrue', 'postgrest', 'realtime', 'storage3', 'supafunc',
+        # supabase e a pilha dele. Os nomes 'gotrue' e 'supafunc' ficaram para
+        # tras: os pacotes viraram supabase_auth e supabase_functions. Ficavam
+        # aqui como hidden import inexistente, que o PyInstaller so avisa e
+        # segue — dava a impressao de estarem cobertos sem estar.
+        'supabase', 'httpx', 'postgrest', 'realtime', 'storage3',
+        'supabase_auth', 'supabase_functions',
         # PDF — o agente.py faz `import pymupdf` sem try/except: sem isto o
         # .exe morre no boot. Faltava na lista.
         'pymupdf', 'pdfplumber',

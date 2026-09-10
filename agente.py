@@ -58,7 +58,7 @@ MACHINE_ID = _gerar_machine_id()
 # Precisa ser bumpada a cada release publicada no GitHub. E ela que o
 # auto-update compara com a tag da release mais recente.
 # ============================================================
-VERSAO = "1.1.5"
+VERSAO = "1.1.6"
 REPO_API_LATEST = "https://api.github.com/repos/lukas913/rnx-agente-varredura/releases/latest"
 NOME_ASSET = "AgenteVarredura.exe"
 
@@ -754,6 +754,18 @@ _ultimo_refresh = time.time() if _sessao_ok else 0
 _REFRESH_INTERVALO = 45 * 60  # Renova a cada 45 min (JWT expira em 60 min)
 
 def _tentar_refresh_token():
+    """Renova a sessao, um de cada vez.
+
+    A trava nao e detalhe: o refresh_token do Supabase e rotativo — usar o mesmo
+    duas vezes invalida a sessao inteira. Com o heartbeat renovando a cada 45min
+    e o processamento renovando ao topar num 'JWT expired', os dois podem cair
+    juntos no mesmo instante. _trava_auth e RLock justamente porque quem chama de
+    _adiar_por_infra ja entra com ela na mao."""
+    with _trava_auth:
+        return _refresh_token_agora()
+
+
+def _refresh_token_agora():
     """Renova o access_token usando refresh_token.
     Prioridade: 1) sessão ativa do gotrue (pode ter feito auto-refresh)
                 2) CONFIG salvo no config.json
@@ -831,6 +843,143 @@ def _tentar_reauth_senha():
         logger.warning(f"Falha ao re-autenticar com senha: {e}")
     _sessao_ok = False
     return False
+
+
+# ============================================================
+# ERRO DE INFRAESTRUTURA != ERRO DE DOCUMENTO
+# ============================================================
+# Ate 10/09/2026 qualquer excecao no meio do processamento mandava o PDF para a
+# pasta de erros. Sessao vencida e rede engasgando entravam na mesma vala que um
+# PDF ilegivel — e o documento sumia da fila sem ninguem saber.
+#
+# Foi o que aconteceu com tres arquivos da Steinke: dois com 'JWT expired' as
+# 12h15 e um com 'WinError 10035' as 13h35. Nada errado com os PDFs.
+#
+# Nao e problema de uma maquina so: token vence e rede oscila em qualquer PC.
+# Entao a regra passa a ser: se a culpa foi da infraestrutura, o arquivo NAO sai
+# do lugar e NAO entra em _arquivos_processados. O rescan de 30s pega de novo,
+# e ate la o token ja foi renovado.
+
+_MAX_TENTATIVAS_INFRA = 8      # depois disso vai para triagem, com o motivo certo
+_tentativas_infra: dict[str, int] = {}
+_proxima_tentativa: dict[str, float] = {}
+
+# Espera entre uma tentativa e outra quando a rede caiu, em segundos. Dobra ate
+# 15 min: 8 tentativas cobrem cerca de meia hora de internet fora antes de
+# desistir. Com o rescan de 30s e sem espera, as 8 tentativas se esgotariam em
+# 4 minutos — tempo de mais nada.
+def _espera_da_tentativa(n: int) -> float:
+    return min(30 * (2 ** (n - 1)), 900)
+
+# A trava serve para dois problemas de uma vez. O primeiro e o WinError 10035
+# ("operacao de soquete sem bloqueio nao pode ser concluida"): ele aparece quando
+# duas threads usam o mesmo socket HTTP ao mesmo tempo — e aqui a thread do
+# watcher e a do rescan chamam processar_arquivo() no mesmo cliente Supabase.
+# O segundo e o refresh: dois refresh simultaneos rotacionam o refresh_token em
+# cima um do outro e derrubam a sessao. Documento chega de um em um mesmo, entao
+# serializar nao custa nada.
+_trava_processamento = threading.Lock()
+_trava_auth = threading.RLock()   # RLock: _adiar_por_infra segura e o refresh pega de novo
+
+# PDF ainda chegando pela rede. O watchdog avisa quando o arquivo APARECE, nao
+# quando termina de copiar — e o pymupdf, aberto no meio da copia, reclama que o
+# arquivo esta vazio ou nao e PDF. Era isso que acontecia com os PGD*_TR.pdf.
+# Um PDF de verdade quebrado cai na mesma rede, so que ai as 8 tentativas se
+# esgotam e ele vai para triagem do mesmo jeito — 45 min mais tarde e sem
+# ninguem perder documento no caminho.
+_SINAIS_ARQUIVO = (
+    "cannot open empty file", "failed to open file", "cannot open broken document",
+    "no objects found", "file is empty", "arquivo vazio", "being used by another process",
+    "sendo usado por outro processo",
+)
+
+_SINAIS_AUTH = (
+    "jwt expired", "jwt is expired", "pgrst301", "invalid jwt", "token is expired",
+    "unauthorized", "not authenticated", "invalid token", "401",
+)
+_SINAIS_REDE = (
+    "10035", "10053", "10054", "10060", "winerror", "timeout", "timed out",
+    "connection", "conexao", "conexão", "ssl", "handshake", "getaddrinfo",
+    "temporarily unavailable", "remotedisconnected", "server disconnected",
+    "connectionreset", "readerror", "writeerror", "protocolerror", "pool timeout",
+    "max retries", "bad gateway", "502", "503", "504",
+    # nomes de classe do httpx/httpcore, que nem sempre trazem a palavra
+    # "connection" no texto da mensagem
+    "connecterror", "connecttimeout", "transporterror", "networkerror",
+    "httpx", "httpcore", "unreachable",
+)
+
+
+def _classificar_erro(e) -> str | None:
+    """Devolve 'auth', 'rede', 'arquivo' — ou None, quando o problema e mesmo
+    do documento e o lugar dele e a triagem.
+
+    Olha o TIPO antes do texto. A mensagem do Windows chega traduzida nesta
+    maquina ('Uma operacao de soquete sem bloqueio...'), entao procurar palavra
+    em ingles no texto nao basta."""
+    if isinstance(e, (FileNotFoundError, PermissionError, IsADirectoryError)):
+        # PDF ainda sendo copiado, ou o arquivo sumiu da pasta no meio do caminho.
+        return "arquivo"
+    if isinstance(e, (ConnectionError, TimeoutError, OSError)):
+        return "rede"
+    texto = f"{type(e).__name__} {e}".lower()
+    if any(s in texto for s in _SINAIS_ARQUIVO):
+        return "arquivo"
+    if any(s in texto for s in _SINAIS_AUTH):
+        return "auth"
+    if any(s in texto for s in _SINAIS_REDE):
+        return "rede"
+    return None
+
+
+def _consigo_ler_evento(evento_id) -> bool:
+    """A obrigacao ainda esta visivel para esta sessao?
+
+    Serve para distinguir 'a obrigacao sumiu' de 'a sessao caiu'. Um update
+    barrado pelo RLS nao levanta erro — volta 200 com lista vazia, igualzinho a
+    um id que nao existe."""
+    try:
+        r = supabase.table("eventos_rotina").select("id").eq("id", evento_id).limit(1).execute()
+        return bool(r.data)
+    except Exception:
+        return False
+
+
+def _adiar_por_infra(caminho: Path, tipo: str, e) -> bool:
+    """Devolve o arquivo para a fila em vez de descarta-lo.
+
+    True  = adiado, o rescan tenta de novo em ate 30s.
+    False = ja tentou demais; quem chamou deve mandar para triagem."""
+    nome = _nome_base(caminho.name)
+    n = _tentativas_infra.get(nome, 0) + 1
+    _tentativas_infra[nome] = n
+
+    if n >= _MAX_TENTATIVAS_INFRA:
+        logger.error(f"[ADIADO] {caminho.name}: {n} tentativas sem conseguir falar "
+                     f"com o servidor ({e}). Agora sim vai para triagem.")
+        _tentativas_infra.pop(nome, None)
+        _proxima_tentativa.pop(nome, None)
+        return False
+
+    if tipo == "auth":
+        # Renovar o token e instantaneo: nao precisa de espera nenhuma, o proprio
+        # rescan de 30s ja e o intervalo.
+        _proxima_tentativa[nome] = 0
+        logger.warning(f"[ADIADO] {caminho.name}: sessao caiu ({e}). "
+                       f"Renovando o token e devolvendo para a fila (tentativa {n}).")
+        with _trava_auth:
+            _tentar_refresh_token()
+    else:
+        espera = _espera_da_tentativa(n)
+        _proxima_tentativa[nome] = time.time() + espera
+        motivo = "arquivo indisponivel" if tipo == "arquivo" else "falha de rede"
+        logger.warning(f"[ADIADO] {caminho.name}: {motivo} ({e}). "
+                       f"Tentativa {n} de {_MAX_TENTATIVAS_INFRA}; "
+                       f"volta para a fila em {int(espera)}s.")
+
+    # O arquivo fica onde esta e fora de _arquivos_processados de proposito.
+    return True
+
 
 # ============================================================
 # CONFIGURAÇÃO DINÂMICA (puxa pastas do Supabase)
@@ -2273,6 +2422,10 @@ def upload_pdf(caminho_pdf: Path, cliente_nome: str, descricao: str) -> str | No
                 },
             )
     except Exception as e:
+        # Rede caida ou token vencido nao sao defeito do PDF. Repassa para cima,
+        # onde processar_arquivo() decide adiar em vez de mandar para triagem.
+        if _classificar_erro(e):
+            raise
         logger.error(f"   Falha no upload do PDF ({storage_path}): {e}")
         return None
 
@@ -2459,7 +2612,15 @@ def _buscar_cliente_por_nome(nome: str) -> dict | None:
 
 
 def processar_arquivo(caminho_pdf: Path) -> None:
-    """Pipeline completo: ler PDF → identificar → buscar → copiar."""
+    """Pipeline completo: ler PDF → identificar → buscar → copiar.
+
+    Serializado por _trava_processamento: o watcher e o rescan periodico chamam
+    esta funcao de threads diferentes, e as duas usam o mesmo cliente Supabase."""
+    with _trava_processamento:
+        _processar_arquivo(caminho_pdf)
+
+
+def _processar_arquivo(caminho_pdf: Path) -> None:
     nome = caminho_pdf.name
 
     # DEFESA 1: ignora se está em pasta interna (redundante com on_created, mas seguro)
@@ -2476,7 +2637,20 @@ def processar_arquivo(caminho_pdf: Path) -> None:
     if nome in _arquivos_processados or nome_base in _arquivos_processados:
         return
 
+    # Adiado por rede/arquivo: espera a vez chegar em vez de bater na porta a
+    # cada 30s enquanto a internet nao volta.
+    espera_ate = _proxima_tentativa.get(nome_base, 0)
+    if espera_ate and time.time() < espera_ate:
+        return
+
     logger.info(f"[PDF] Novo arquivo detectado: {nome}")
+
+    # Nasce vazio de proposito. Se analisar_pdf() estourar, o except la embaixo
+    # le 'dados' — e com ela nao-atribuida o proprio tratamento de erro quebra
+    # com UnboundLocalError, que sobe e mata o ciclo inteiro do rescan. Era o
+    # "[RESCAN] Erro no rescan periodico: cannot access local variable 'dados'"
+    # que aparecia no log: um PDF ilegivel derrubava a fila toda daquela rodada.
+    dados = None
 
     try:
         # 1. Extrair dados do PDF
@@ -2676,6 +2850,8 @@ def processar_arquivo(caminho_pdf: Path) -> None:
         if sucesso:
             sem_mov_str = " [SEM MOVIMENTO]" if dados.get("sem_movimento") else ""
             logger.info(f"[OK] {nome}: Baixa realizada!{sem_mov_str} ({razao_social} - {dados['tipo_guia']})")
+            _tentativas_infra.pop(nome_base, None)   # tropecos anteriores nao contam mais
+            _proxima_tentativa.pop(nome_base, None)
             _copiar_para_processados(caminho_pdf)
             # Arquiva uma cópia na pasta do cliente no servidor (bônus, nunca quebra a baixa)
             _arquivar_guia_servidor(caminho_pdf, razao_social, dados["tipo_guia"], dados["competencia"])
@@ -2691,12 +2867,38 @@ def processar_arquivo(caminho_pdf: Path) -> None:
                 status="sucesso",
             )
         else:
+            # O update voltou sem linha nenhuma. Pode ser a obrigacao ter sumido
+            # — ou a sessao ter caido: quando o RLS bloqueia, o PostgREST devolve
+            # 200 com lista vazia, sem erro nenhum. Antes de condenar o
+            # documento, confere se ainda enxergamos a obrigacao.
+            if not _consigo_ler_evento(obrigacao["id"]):
+                if _adiar_por_infra(caminho_pdf, "auth",
+                                    "update sem efeito e obrigacao invisivel — sessao caiu"):
+                    return
             msg = "Falha ao atualizar obrigação no banco"
             logger.error(f"[ERRO] {nome}: {msg}")
             dados["_razao_social"] = razao_social
             _copiar_para_erro(caminho_pdf, msg, dados)
 
     except Exception as e:
+        # Antes de culpar o documento, pergunta de quem foi a culpa. Sessao
+        # vencida e rede caida devolvem o arquivo para a fila; so o que sobra
+        # depois disso e problema de verdade do PDF.
+        tipo_falha = _classificar_erro(e)
+        if tipo_falha:
+            if _adiar_por_infra(caminho_pdf, tipo_falha, e):
+                return
+            # Esgotou as tentativas. Vai para triagem, mas com o motivo escrito
+            # do jeito certo: ninguem precisa procurar defeito num PDF que so
+            # ficou sem servidor para falar.
+            logger.error(f"[ERRO] {nome}: sem servidor apos {_MAX_TENTATIVAS_INFRA} tentativas - {e}")
+            _copiar_para_erro(
+                caminho_pdf,
+                f"Nao foi problema do documento: {_MAX_TENTATIVAS_INFRA} tentativas "
+                f"sem conseguir falar com o servidor ({tipo_falha}). Ultimo erro: {e}",
+                dados if isinstance(dados, dict) else {},
+            )
+            return
         logger.error(f"[ERRO] {nome}: Erro inesperado - {e}", exc_info=True)
         _copiar_para_erro(caminho_pdf, str(e), dados if isinstance(dados, dict) else {})
 
@@ -3334,7 +3536,14 @@ def main():
             time.sleep(30)  # 30 segundos
             try:
                 pdfs = [p for p in PASTA_MONITORADA.rglob("*.pdf") if not _esta_em_pasta_interna(p)]
-                novos = [p for p in pdfs if p.name not in _arquivos_processados and _nome_base(p.name) not in _arquivos_processados]
+                agora = time.time()
+                novos = [
+                    p for p in pdfs
+                    if p.name not in _arquivos_processados
+                    and _nome_base(p.name) not in _arquivos_processados
+                    # adiado por rede: ainda esperando a vez, nao conta como "novo"
+                    and agora >= _proxima_tentativa.get(_nome_base(p.name), 0)
+                ]
                 if novos:
                     logger.info(f"[RESCAN] {len(novos)} PDF(s) não detectado(s) pelo watcher. Processando...")
                     for pdf in novos:
