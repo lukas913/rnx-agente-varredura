@@ -18,6 +18,10 @@ from datetime import datetime, date, timezone
 from pathlib import Path
 
 from supabase import create_client
+try:
+    from supabase.lib.client_options import SyncClientOptions as _OpcoesCliente
+except ImportError:
+    from supabase.lib.client_options import ClientOptions as _OpcoesCliente
 from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
 from watchdog.events import FileSystemEventHandler
@@ -52,13 +56,29 @@ def _gerar_machine_id() -> str:
 
 MACHINE_ID = _gerar_machine_id()
 
+
+def _novo_cliente(url: str, key: str):
+    """Cliente Supabase SEM a renovacao automatica da biblioteca.
+
+    A biblioteca liga um timer a cada sessao salva e, perto de expirar, renova
+    sozinha em segundo plano. Isso derrubou o agente em 14/09/2026: a janela de
+    login cria um cliente proprio, faz o sign-in e entrega o refresh_token para
+    o cliente principal, que o rotaciona na hora. O cliente da janela morria de
+    vista mas o timer dele nao — uma hora depois tentava renovar com o token ja
+    rotacionado. O Supabase trata reuso de refresh_token como roubo e revoga a
+    sessao inteira, inclusive a do cliente principal ("Already Used").
+
+    Quem renova a sessao e o agente, e so ele (_tentar_refresh_token, com trava).
+    Todo cliente do agente nasce por aqui."""
+    return create_client(url, key, options=_OpcoesCliente(auto_refresh_token=False))
+
 # ============================================================
 # VERSAO
 #
 # Precisa ser bumpada a cada release publicada no GitHub. E ela que o
 # auto-update compara com a tag da release mais recente.
 # ============================================================
-VERSAO = "1.1.6"
+VERSAO = "1.1.7"
 REPO_API_LATEST = "https://api.github.com/repos/lukas913/rnx-agente-varredura/releases/latest"
 NOME_ASSET = "AgenteVarredura.exe"
 
@@ -179,7 +199,7 @@ def _setup_primeiro_run():
         root.update()
 
         try:
-            sb = create_client(cfg["supabase_url"], cfg["supabase_key"])
+            sb = _novo_cliente(cfg["supabase_url"], cfg["supabase_key"])
             auth_resp = sb.auth.sign_in_with_password({"email": email, "password": senha})
             user = auth_resp.user
             if not user:
@@ -344,7 +364,7 @@ def _reautenticar():
         status_label.config(text="Autenticando...", fg="#f39c12")
         root.update()
         try:
-            sb = create_client(cfg["supabase_url"], cfg["supabase_key"])
+            sb = _novo_cliente(cfg["supabase_url"], cfg["supabase_key"])
             auth_resp = sb.auth.sign_in_with_password({"email": email, "password": senha})
             if not auth_resp.user or not auth_resp.session:
                 status_label.config(text="Senha incorreta", fg="#e74c3c")
@@ -678,7 +698,7 @@ if verificar_atualizacao():
     sys.exit(0)
 
 # Supabase
-supabase = create_client(CONFIG["supabase_url"], CONFIG["supabase_key"])
+supabase = _novo_cliente(CONFIG["supabase_url"], CONFIG["supabase_key"])
 
 # Restaurar sessão autenticada (sem isso, RLS bloqueia INSERT na triagem)
 _refresh_token = CONFIG.get("refresh_token")
@@ -726,6 +746,15 @@ if _refresh_token:
             try:
                 _session2 = supabase.auth.refresh_session(CONFIG["refresh_token"])
                 if _session2 and _session2.session:
+                    # Grava o token rotacionado JA. Antes ficava no disco o token
+                    # da janela de login, que acabou de ser consumido: reiniciar
+                    # o agente antes da proxima renovacao reusava esse token e o
+                    # Supabase revogava a sessao inteira.
+                    _rt2 = _session2.session.refresh_token
+                    if _rt2 and _rt2 != CONFIG.get("refresh_token"):
+                        CONFIG["refresh_token"] = _rt2
+                        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                            json.dump(CONFIG, f, indent=4, ensure_ascii=False)
                     _aplicar_sessao(_session2)
                     _sessao_ok = True
                     logger.info("Sessão restaurada após reautenticação")
@@ -1874,15 +1903,75 @@ def extrair_vencimento(texto: str) -> str | None:
     return None
 
 
+def valor_do_codigo_barras(codigo: str) -> float | None:
+    """O valor que esta DENTRO do codigo de barras, por posicao fixa.
+
+    Guia de arrecadacao (DAS, DARF, GPS, FGTS, estaduais) comeca com 8:
+      - linha digitavel = 48 digitos (4 blocos de 11 + digito verificador)
+      - codigo de barras = 44 digitos
+      - o valor mora nas posicoes 5 a 15 do codigo de 44, em centavos
+    Boleto bancario: linha digitavel de 47 digitos, valor = ultimos 10.
+
+    E a mesma conta que o rnx-guia-decoder.js faz no navegador — a norma
+    FEBRABAN e a mesma para os dois. Nao ha leitura de texto envolvida: ou o
+    codigo existe e o valor sai exato, ou nao sai nada.
+    """
+    cod = re.sub(r"\D", "", codigo or "")
+
+    if len(cod) == 48 and cod[0] == "8":
+        bc = "".join(cod[i * 12: i * 12 + 11] for i in range(4))
+        return int(bc[4:15]) / 100
+    if len(cod) == 44 and cod[0] == "8":
+        return int(cod[4:15]) / 100
+    # Boleto: 47 digitos. Alguns emissores colam o digito do banco na frente
+    # e viram 48 SEM comecar com 8 — o valor continua nos ultimos 10.
+    if len(cod) == 47 or (len(cod) == 48 and cod[0] != "8"):
+        return int(cod[-10:]) / 100
+    return None
+
+
 def extrair_valor(texto: str) -> float | None:
-    """Extrai o valor principal da guia."""
+    """Extrai o valor principal da guia.
+
+    DUAS TENTATIVAS, nesta ordem — 11/09/2026:
+
+      1. O CODIGO DE BARRAS. E posicao fixa por norma, nao depende de como o
+         PDF escreveu as coisas. Sai exato ou nao sai.
+      2. O texto ("Valor Total: R$ ...").
+
+    Ate hoje so existia a 2, e por isso 25 DAS de 08/2026 entraram no sistema
+    SEM VALOR: aqueles PDFs nao escrevem a frase que o padrao procurava. O
+    agente ja extraia o codigo de barras e gravava em codigo_boleto — tinha o
+    valor na mao e nao usava.
+
+    A ordem importa. O texto e mais facil de enganar: foi lendo texto que dois
+    registros ganharam R$ 32 e R$ 62 milhoes, de um pedaco de data que passou
+    por valor. O codigo de barras nao tem esse risco.
+    """
+    codigo = extrair_codigo_barras(texto)
+    if codigo:
+        try:
+            v = valor_do_codigo_barras(codigo)
+            # Zero no codigo de barras e guia sem valor a pagar, nao falha de
+            # leitura: nesse caso o texto tambem nao vai ter valor nenhum.
+            if v and v > 0:
+                return v
+        except Exception:
+            pass
+
     # "Valor Total: R$ 1.234,56" ou "VALOR DO DOCUMENTO 1.234,56"
     padrao = r"(?:valor\s+(?:total|do\s+documento|principal|a\s+recolher))[:\s]*R?\$?\s*([\d.,]+)"
     match = re.search(padrao, texto, re.IGNORECASE)
     if match:
         valor_str = match.group(1).replace(".", "").replace(",", ".")
         try:
-            return float(valor_str)
+            v = float(valor_str)
+            # Guarda contra o que aconteceu com o ISS: nenhuma guia de
+            # escritorio de contabilidade passa de um milhao. Numero desse
+            # tamanho e leitura errada, e valor errado e pior que valor nenhum.
+            if 0 < v < 1_000_000:
+                return v
+            logger.warning(f"   valor implausivel no texto ({v}) — ignorado")
         except ValueError:
             pass
     return None
