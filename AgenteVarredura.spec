@@ -9,6 +9,8 @@ a = Analysis(
     hiddenimports=[
         # modulos do proprio agente
         'scan_documentos', 'scraper_agenda', 'servidor_api',
+        # consulta de CNPJ na Receita (janela do Edge + CDP por websocket)
+        'receita_cnpj', 'websockets', 'websockets.sync', 'websockets.sync.client',
         # bandeja e imagem
         'pystray', 'PIL', 'PIL.Image',
         # monitoramento de pasta
