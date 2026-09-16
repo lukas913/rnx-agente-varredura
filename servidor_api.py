@@ -204,7 +204,32 @@ def criar_app(supabase_client, config):
             "online": True,
             "servidor_acessivel": PASTA_SERVIDOR.exists(),
             "timestamp": datetime.now().isoformat(),
+            # O RNX pergunta isto antes de mostrar "Consultar na Receita":
+            # agente antigo nao tem a rota e o botao nao pode prometer o que nao ha.
+            "recursos": ["explorador", "receita_cnpj"],
         }
+
+    # ----------------------------------------------------------
+    # GET /api/receita/cnpj/{cnpj}   (16/09/2026)
+    # Abre a consulta oficial da Receita numa janela do Edge; a PESSOA resolve
+    # o captcha; devolve o comprovante e o quadro de socios. Ver receita_cnpj.py.
+    # Uma consulta por vez: duas janelas de captcha ao mesmo tempo so confundem.
+    # ----------------------------------------------------------
+    _trava_receita = threading.Lock()
+
+    @app.get("/api/receita/cnpj/{cnpj}")
+    def api_receita_cnpj(cnpj: str):
+        if not _trava_receita.acquire(blocking=False):
+            return JSONResponse(status_code=409, content={
+                "erro": "Ja existe uma consulta na Receita aberta. Termine ou feche aquela janela."})
+        try:
+            from receita_cnpj import consultar
+            resultado = consultar(cnpj, tempo_limite=300, log=logger.info)
+            if "erro" in resultado:
+                return JSONResponse(status_code=422, content=resultado)
+            return resultado
+        finally:
+            _trava_receita.release()
 
     # ----------------------------------------------------------
     # GET /api/explorar?cliente_id=123&path=...
