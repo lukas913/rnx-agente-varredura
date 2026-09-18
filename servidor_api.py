@@ -15,6 +15,9 @@ from datetime import datetime
 
 logger = logging.getLogger("agente-varredura")
 
+# Preenchido pelo agente.py antes de subir a API (o RNX mostra no modal do agente)
+VERSAO_AGENTE = None
+
 # Importa funções de classificação do scan_documentos
 from scan_documentos import (
     classificar_arquivo,
@@ -161,10 +164,12 @@ def criar_app(supabase_client, config):
 
     app = FastAPI(title="Agente Varredura API", docs_url=None, redoc_url=None)
 
-    # CORS: permite acesso do browser (Netlify, localhost, etc.)
+    # CORS (1.1.9, 18/09/2026): antes era allow_origins=["*"] — QUALQUER site aberto
+    # no navegador podia ler as pastas do servidor pelo /api/explorar. Agora so o
+    # RNX (producao e previas do Netlify) e paginas locais.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origin_regex=r"^(https://([a-z0-9-]+--)?routineex\.netlify\.app|http://(localhost|127\.0\.0\.1)(:\d+)?)$",
         allow_methods=["GET", "POST", "OPTIONS"],
         allow_headers=["*"],
     )
@@ -206,8 +211,63 @@ def criar_app(supabase_client, config):
             "timestamp": datetime.now().isoformat(),
             # O RNX pergunta isto antes de mostrar "Consultar na Receita":
             # agente antigo nao tem a rota e o botao nao pode prometer o que nao ha.
-            "recursos": ["explorador", "receita_cnpj"],
+            "recursos": ["explorador", "receita_cnpj", "situacao_fiscal"],
+            "versao": VERSAO_AGENTE,
+            "usuario": config.get("user_nome") or config.get("user_email"),
+            "usuario_id": config.get("user_id"),
         }
+
+    # ----------------------------------------------------------
+    # POST /api/fiscal/situacao   (18/09/2026)
+    # A Central de Automacoes entrega aqui o resultado da consulta de situacao
+    # fiscal (registros do dados-painel.json). O agente, que ja esta logado,
+    # grava no RNX pela funcao rnx_registrar_situacao_fiscal — a Central nao
+    # guarda senha nem chave do RNX. O banco decide pendencia, tarefa e aviso.
+    # Exige o cabecalho X-RNX-Local: navegador de outro site nao consegue mandar
+    # cabecalho proprio sem passar pelo CORS acima.
+    # ----------------------------------------------------------
+    from fastapi import Body, Header
+
+    # So o que o RNX usa. A lista completa de debitos e suspensos fica no PDF/JSON da Central.
+    _CAMPOS_FISCAIS = ("cnpj", "empresa", "consultadoEm", "risco", "totalDebitos", "quantidadeDebitos",
+                       "totalSuspenso", "quantidadeSuspensos", "inscricoesPgfn", "simples", "certidao",
+                       "problemas", "arquivo", "origem", "versaoAnalise")
+
+    # def (nao async): o FastAPI roda numa thread e as gravacoes nao travam as outras rotas
+    @app.post("/api/fiscal/situacao")
+    def api_fiscal_situacao(corpo: dict = Body(...), x_rnx_local: str | None = Header(default=None)):
+        if x_rnx_local != "1":
+            raise HTTPException(403, "Cabecalho X-RNX-Local ausente")
+        consultas = corpo.get("consultas")
+        if not isinstance(consultas, list) or not consultas:
+            raise HTTPException(400, "Envie {\"consultas\": [...]}")
+        if len(consultas) > 500:
+            raise HTTPException(413, "No maximo 500 consultas por envio")
+        gerar = bool(corpo.get("gerar_tarefas", True))
+
+        # Mais antiga primeiro: so a mais recente de cada cliente mexe nas pendencias
+        consultas = sorted((c for c in consultas if isinstance(c, dict)),
+                           key=lambda c: str(c.get("consultadoEm") or ""))
+        resultados = []
+        for c in consultas:
+            registro = {k: c[k] for k in _CAMPOS_FISCAIS if k in c}
+            try:
+                r = supabase_client.rpc("rnx_registrar_situacao_fiscal",
+                                        {"p": registro, "p_gerar_tarefas": gerar}).execute()
+                resultados.append(r.data)
+            except Exception as e:
+                resultados.append({"ok": False, "cnpj": registro.get("cnpj"), "motivo": str(e)[:200]})
+        tarefas = sorted({r.get("tarefa") for r in resultados if isinstance(r, dict) and r.get("tarefa")})
+        resumo = {
+            "recebidas": len(consultas),
+            "gravadas": sum(1 for r in resultados if isinstance(r, dict) and r.get("consulta")),
+            "repetidas": sum(1 for r in resultados if isinstance(r, dict) and r.get("repetida")),
+            "sem_cliente": sum(1 for r in resultados if isinstance(r, dict) and r.get("consulta") and not r.get("cliente")),
+            "erros": sum(1 for r in resultados if not (isinstance(r, dict) and r.get("ok"))),
+            "tarefas": tarefas,
+        }
+        logger.info(f"[FISCAL] Situacao fiscal recebida: {resumo}")
+        return {"resumo": resumo, "resultados": resultados}
 
     # ----------------------------------------------------------
     # GET /api/receita/cnpj/{cnpj}   (16/09/2026)
@@ -572,7 +632,9 @@ def iniciar_servidor(supabase_client, config, porta: int = 5123):
 
         server_config = uvicorn.Config(
             app,
-            host="0.0.0.0",
+            # 1.1.9: so este computador. Antes era 0.0.0.0 e qualquer maquina da
+            # rede chamava o agente de outra pessoa (explorar pastas, importar).
+            host="127.0.0.1",
             port=porta,
             log_level="warning",
             access_log=False,
