@@ -78,7 +78,7 @@ def _novo_cliente(url: str, key: str):
 # Precisa ser bumpada a cada release publicada no GitHub. E ela que o
 # auto-update compara com a tag da release mais recente.
 # ============================================================
-VERSAO = "1.1.8"
+VERSAO = "1.1.9"
 REPO_API_LATEST = "https://api.github.com/repos/lukas913/rnx-agente-varredura/releases/latest"
 NOME_ASSET = "AgenteVarredura.exe"
 
@@ -278,20 +278,25 @@ def _literal_ps(valor):
 
 
 def _registrar_startup():
-    """Garante o atalho do agente na pasta Inicializar do Windows.
+    """Garante o atalho do agente na pasta Inicializar do Windows e, desde a 1.1.9,
+    tambem no menu Iniciar ("RNX Agente"), para a pessoa conseguir abrir de novo.
 
     Idempotente: se o atalho já aponta para o executável atual, sai sem mexer.
     O .exe é console=False, então ele sobe sem janela nenhuma."""
-    try:
-        startup_dir = (Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows"
-                       / "Start Menu" / "Programs" / "Startup")
-        if not startup_dir.is_dir():
-            logger.warning("[STARTUP] Pasta Inicializar não encontrada; autostart não registrado.")
-            return
+    programas = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+    startup_dir = programas / "Startup"
+    if startup_dir.is_dir():
+        _garantir_atalho(startup_dir / "Agente Varredura.lnk")
+    else:
+        logger.warning("[STARTUP] Pasta Inicializar não encontrada; autostart não registrado.")
+    if programas.is_dir():
+        _garantir_atalho(programas / "RNX Agente.lnk")
 
+
+def _garantir_atalho(lnk_path):
+    try:
         vbs_path = BASE_DIR / "iniciar-agente.vbs"
         alvo = str(vbs_path if vbs_path.exists() else Path(sys.executable).resolve())
-        lnk_path = startup_dir / "Agente Varredura.lnk"
 
         script = (
             "$ErrorActionPreference='Stop';"
@@ -315,7 +320,46 @@ def _registrar_startup():
         else:
             logger.warning(f"[STARTUP] PowerShell falhou: {(r.stderr or '').strip()[:200]}")
     except Exception as e:
-        logger.warning(f"[STARTUP] Não foi possível registrar o autostart: {e}")
+        logger.warning(f"[STARTUP] Não foi possível registrar o atalho {lnk_path}: {e}")
+
+
+def _avisar_sem_login():
+    """Fechou a janela de login sem entrar (1.1.9). Antes o agente so saia: o atalho
+    de iniciar com o Windows nem tinha sido criado e a pessoa nao tinha como abrir
+    de novo. Agora garante os atalhos e explica o caminho."""
+    _registrar_startup()
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        r = tk.Tk()
+        r.withdraw()
+        messagebox.showinfo(
+            "RNX Agente",
+            "O agente precisa do seu login do RNX para funcionar.\n\n"
+            "Ele vai pedir de novo quando o Windows iniciar. Para entrar agora, "
+            "abra \"RNX Agente\" no menu Iniciar.",
+            parent=r)
+        r.destroy()
+    except Exception:
+        pass
+
+
+def _reiniciar_agente():
+    """Abre uma nova copia do agente em 3 s (depois que esta ja saiu e soltou a trava
+    de instancia unica). Usado por "Entrar com outro usuario"."""
+    import subprocess
+    if getattr(sys, "frozen", False):
+        vbs_path = BASE_DIR / "iniciar-agente.vbs"
+        alvo = vbs_path if vbs_path.exists() else Path(sys.executable).resolve()
+        cmd = (f"Start-Sleep -Seconds 3; Start-Process -FilePath {_literal_ps(alvo)} "
+               f"-WorkingDirectory {_literal_ps(BASE_DIR)}")
+    else:
+        cmd = (f"Start-Sleep -Seconds 3; Start-Process -FilePath {_literal_ps(sys.executable)} "
+               f"-ArgumentList {_literal_ps(Path(sys.argv[0]).resolve())} -WorkingDirectory {_literal_ps(BASE_DIR)}")
+    subprocess.Popen(
+        ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", cmd],
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0),
+    )
 
 
 def _reautenticar():
@@ -397,7 +441,8 @@ else:
 USER_ID = CONFIG.get("user_id")
 if not USER_ID:
     if not _setup_primeiro_run():
-        sys.exit(0)  # Usuário fechou sem configurar
+        _avisar_sem_login()   # garante os atalhos e diz como abrir de novo
+        sys.exit(0)
     with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
         CONFIG = json.load(f)
     USER_ID = CONFIG["user_id"]
@@ -405,7 +450,10 @@ if not USER_ID:
 # Se tem user_id mas não tem refresh_token, pede só a senha
 if not CONFIG.get("refresh_token"):
     if not _reautenticar():
-        print("Reautenticação cancelada. O agente não conseguirá enviar para triagem.")
+        # 1.1.9: antes seguia rodando sem sessao, quebrado e calado. Sem login nada
+        # chega ao RNX: melhor sair avisando e pedir de novo no proximo inicio.
+        _avisar_sem_login()
+        sys.exit(0)
     else:
         with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
             CONFIG = json.load(f)
@@ -3381,6 +3429,23 @@ def criar_icone_tray(observer: Observer) -> None:
             observer.stop()
             icon.stop()
 
+        def on_trocar_usuario(icon, item):
+            # 1.1.9: esquece o login deste computador e abre de novo pedindo e-mail e senha.
+            try:
+                with open(CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+                    cfg = json.load(f)
+                for k in ("user_id", "user_email", "user_nome", "refresh_token", "user_password"):
+                    cfg.pop(k, None)
+                with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, indent=4, ensure_ascii=False)
+                logger.info("[TRAY] Login esquecido a pedido; reabrindo para entrar com outro usuario")
+                _reiniciar_agente()
+            except Exception as e:
+                logger.error(f"[TRAY] Falha ao trocar de usuario: {e}")
+                return
+            observer.stop()
+            icon.stop()
+
         menu = pystray.Menu(
             pystray.MenuItem(
                 lambda item: f"Processados: {stats['processados']} | Erros: {stats['erros']}",
@@ -3391,6 +3456,10 @@ def criar_icone_tray(observer: Observer) -> None:
             pystray.MenuItem("📂 Abrir pasta monitorada", on_abrir_pasta),
             pystray.MenuItem("Abrir processados", on_abrir_processados),
             pystray.MenuItem("Abrir erros", on_abrir_erros),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(lambda item: f"Conectado como {CONFIG.get('user_nome') or CONFIG.get('user_email') or '?'} (v{VERSAO})",
+                             None, enabled=False),
+            pystray.MenuItem("Entrar com outro usuário", on_trocar_usuario),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Sair", on_sair),
         )
@@ -3576,6 +3645,8 @@ def main():
     logger.info("[AGENDA] Scraper de agenda tributária ativo (executa ao iniciar + diário)")
 
     # Inicia servidor API local (explorador de arquivos do servidor)
+    import servidor_api as _srv_api
+    _srv_api.VERSAO_AGENTE = VERSAO   # o RNX mostra a versao no modal do agente
     api_thread = _iniciar_servidor_api(supabase, CONFIG, porta=5123)
     if api_thread:
         logger.info("[API] Explorador de arquivos ativo em http://localhost:5123")
