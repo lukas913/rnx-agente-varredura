@@ -228,7 +228,7 @@ def criar_app(supabase_client, config):
     # ----------------------------------------------------------
     from fastapi import Body, Header
 
-    # So o que o RNX usa. A lista completa de debitos e suspensos fica no PDF/JSON da Central.
+    # So o que o RNX usa. Debitos e suspensos vao enxutos (ver _enxugar, 1.1.14).
     _CAMPOS_FISCAIS = ("cnpj", "empresa", "consultadoEm", "risco", "totalDebitos", "quantidadeDebitos",
                        "totalSuspenso", "quantidadeSuspensos", "inscricoesPgfn", "simples", "certidao",
                        "problemas", "arquivo", "origem", "versaoAnalise")
@@ -408,8 +408,17 @@ def criar_app(supabase_client, config):
         consultas = sorted((c for c in consultas if isinstance(c, dict)),
                            key=lambda c: str(c.get("consultadoEm") or ""))
         resultados = []
+        def _enxugar(itens, limite):
+            # So o que a tarefa mostra (1.1.14): receita, periodo, vencimento e valores
+            if not isinstance(itens, list):
+                return []
+            return [{k: i.get(k) for k in ("receita", "pa", "vcto", "devedor", "consolidado", "categoria")}
+                    for i in itens[:limite] if isinstance(i, dict)]
+
         for c in consultas:
             registro = {k: c[k] for k in _CAMPOS_FISCAIS if k in c}
+            registro["debitos"] = _enxugar(c.get("debitos"), 200)
+            registro["suspensos"] = _enxugar(c.get("suspensos"), 100)
             try:
                 r = supabase_client.rpc("rnx_registrar_situacao_fiscal",
                                         {"p": registro, "p_gerar_tarefas": gerar}).execute()
