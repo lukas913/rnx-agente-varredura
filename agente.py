@@ -78,7 +78,7 @@ def _novo_cliente(url: str, key: str):
 # Precisa ser bumpada a cada release publicada no GitHub. E ela que o
 # auto-update compara com a tag da release mais recente.
 # ============================================================
-VERSAO = "1.1.11"
+VERSAO = "1.1.12"
 REPO_API_LATEST = "https://api.github.com/repos/lukas913/rnx-agente-varredura/releases/latest"
 NOME_ASSET = "AgenteVarredura.exe"
 
@@ -517,6 +517,15 @@ def verificar_atualizacao():
         logger.info(f"[UPDATE] Rodando como script (v{VERSAO}) — auto-update desligado")
         return False
 
+    # Teste da troca SEM publicar versao: usa uma copia deste proprio executavel como
+    # "versao nova" e percorre o mesmo caminho da atualizacao real.
+    if "--testar-troca" in sys.argv:
+        exe = Path(sys.executable)
+        novo = exe.parent / f"{exe.stem}.novo.exe"
+        shutil.copyfile(exe, novo)
+        _registrar_troca("TESTE de troca pedido (--testar-troca)")
+        return _instalar_e_reabrir(novo, "teste")
+
     import urllib.request
     cabecalho = {"User-Agent": f"RNX-AgenteVarredura/{VERSAO}"}
 
@@ -578,89 +587,80 @@ def verificar_atualizacao():
         except Exception: pass
         return False
 
-    # Um .exe em execucao nao pode sobrescrever a si mesmo. O .cmd abaixo espera
-    # este PID sumir da lista de processos, troca o arquivo e reabre o agente.
-    pid = os.getpid()
-    bat = exe_atual.parent / "_atualizar.cmd"
-    # O .cmd deixa rastro proprio: ele roda depois que este processo morreu,
-    # entao nao ha como registrar o que aconteceu no log do agente. Sem isso a
-    # troca falhava em silencio e so dava para diagnosticar por eliminacao.
-    log_troca = BASE_DIR / "_logs" / "atualizacao.log"
-    # newline="" e obrigatorio: sem ele o Python traduz cada \n para \r\n e o
-    # arquivo sai com \r\r\n. O cmd nao aceita — o rotulo vira ":esperar\r", o
-    # "goto esperar" nao encontra o destino e o script morre antes de trocar o
-    # executavel. Foi exatamente o que aconteceu no primeiro teste: o download
-    # completou, o .cmd foi criado, e nada foi substituido.
-    # A pergunta certa nao e "o processo morreu?" e sim "o arquivo ja pode ser
-    # substituido?". Tentar o move em laco responde as duas de uma vez: enquanto
-    # o .exe estiver em uso o Windows recusa, e no instante em que liberar, passa.
-    #
-    # Tres armadilhas do cmd que este formato evita, todas encontradas testando:
-    #   - `timeout` exige console e falha na hora quando o processo nasce sem um,
-    #     transformando a espera em laco infinito. Usamos `ping` para pausar.
-    #   - `goto` dentro de um bloco entre parenteses tem comportamento traicoeiro.
-    #     Aqui nao ha nenhum bloco.
-    #   - depender de `tasklist | find "<pid>"` quebra conforme o idioma do
-    #     Windows, que muda a mensagem de "nenhuma tarefa encontrada".
-    #
-    # Limite de 60 tentativas (~2 min). Se estourar, fica registrado no log em
-    # vez de tentar para sempre.
-    bat.write_text(
-        "@echo off\r\n"
-        f'echo [%date% %time%] iniciado (agente pid {pid}) >> "{log_troca}"\r\n'
-        "set /a tentativas=0\r\n"
-        ":tentar\r\n"
-        "set /a tentativas+=1\r\n"
-        f'move /y "{novo}" "{exe_atual}" >nul 2>&1\r\n'
-        f'if not exist "{novo}" goto pronto\r\n'
-        "if %tentativas% geq 60 goto desistiu\r\n"
-        "ping -n 2 127.0.0.1 >nul\r\n"
-        "goto tentar\r\n"
-        ":pronto\r\n"
-        f'echo [%date% %time%] executavel substituido apos %tentativas% tentativa(s) >> "{log_troca}"\r\n'
-        f'start "" "{exe_atual}"\r\n'
-        f'echo [%date% %time%] agente reiniciado >> "{log_troca}"\r\n'
-        # 1.1.10: na troca 1.1.8 -> 1.1.9 (18/09) o "start" disparou e o agente novo
-        # nao ficou de pe. Confere depois de ~25 s e tenta de novo, com rastro.
-        "ping -n 26 127.0.0.1 >nul\r\n"
-        'tasklist /fi "imagename eq AgenteVarredura.exe" /nh | find /i "AgenteVarredura.exe" >nul\r\n'
-        "if not errorlevel 1 goto confirmado\r\n"
-        f'echo [%date% %time%] agente novo nao estava rodando: abrindo de novo >> "{log_troca}"\r\n'
-        f'start "" "{exe_atual}"\r\n'
-        "goto fim\r\n"
-        ":confirmado\r\n"
-        f'echo [%date% %time%] conferido: agente em execucao >> "{log_troca}"\r\n'
-        ":fim\r\n"
-        'del "%~f0"\r\n'
-        "exit /b\r\n"
-        ":desistiu\r\n"
-        f'echo [%date% %time%] DESISTI: o executavel seguiu bloqueado apos %tentativas% tentativas >> "{log_troca}"\r\n'
-        "exit /b\r\n",
-        encoding="utf-8", newline="")
+    return _instalar_e_reabrir(novo, tag)
 
-    # Somente DETACHED_PROCESS. A versao anterior combinava com CREATE_NO_WINDOW
-    # e o Windows nao aceita os dois juntos — sao mutuamente exclusivos, e o
-    # processo simplesmente nao subia. O .cmd ficava no disco intacto e o
-    # executavel nunca era trocado, sem erro nenhum aparecer.
-    # DETACHED_PROCESS ja garante que nao aparece janela: o processo nasce sem
-    # console. E precisa ser destacado mesmo, para sobreviver a saida deste.
+
+def _registrar_troca(msg: str) -> None:
+    """Rastro da troca de versao em _logs/atualizacao.log (o log do agente e por dia)."""
     try:
-        import subprocess
-        DETACHED_PROCESS = 0x00000008
-        proc = subprocess.Popen(["cmd", "/c", str(bat)],
-                                creationflags=DETACHED_PROCESS, close_fds=True)
-        logger.info(f"[UPDATE] Script de troca disparado (pid {proc.pid})")
+        with open(BASE_DIR / "_logs" / "atualizacao.log", "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%d/%m/%Y %H:%M:%S}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _instalar_e_reabrir(novo: Path, tag: str) -> bool:
+    """Troca o executavel e abre a versao nova (1.1.12, 21/09/2026).
+
+    Ate a 1.1.11 um .cmd destacado esperava este processo sair, trocava o arquivo e
+    dava `start` no agente. A troca funcionava, mas o agente novo nao ficava de pe
+    (18/09 e 21/09 nesta maquina: nenhuma linha no log; aberto na mao, subia). A
+    conferencia da 1.1.10 (`tasklist | find`) travava para sempre nesse processo sem
+    console — e nem com arquivo em vez de pipe o tasklist enxerga ali.
+
+    Agora sem .cmd:
+      1. O Windows deixa RENOMEAR um .exe em uso: este vira AgenteVarredura.antigo.exe.
+      2. O novo entra no lugar.
+      3. O Explorer abre o novo, como um clique duplo: nasce fora da arvore de
+         processos deste agente, entao nao morre junto com ele.
+      4. .aguardar_pid avisa a versao nova para esperar esta sair antes de pegar a
+         trava de instancia unica (senao ela veria esta viva e desistiria).
+    A versao nova apaga o .antigo.exe quando sobe (_limpar_executaveis_antigos)."""
+    import subprocess
+    exe_atual = Path(sys.executable)
+    antigo = exe_atual.with_name(f"{exe_atual.stem}.antigo.exe")
+    if antigo.exists():
+        try:
+            antigo.unlink()
+        except Exception:
+            antigo = exe_atual.with_name(f"{exe_atual.stem}.antigo.{int(time.time())}.exe")
+    try:
+        os.replace(exe_atual, antigo)
+        try:
+            os.replace(novo, exe_atual)
+        except Exception:
+            os.replace(antigo, exe_atual)   # desfaz: o agente continua na versao atual
+            raise
     except Exception as e:
-        logger.error(f"[UPDATE] Falha ao disparar a troca: {e}")
+        logger.error(f"[UPDATE] Falha ao trocar o executavel: {e}")
+        _registrar_troca(f"FALHA ao trocar o executavel para {tag}: {e}")
         return False
+    _registrar_troca(f"executavel trocado para {tag} (anterior guardado como {antigo.name})")
 
-    # Marca a tag ANTES de sair. Se o proximo boot ainda reportar versao antiga,
-    # a trava la em cima reconhece a situacao e nao repete o download.
-    CONFIG["ultima_tag_instalada"] = tag
-    _gravar_config()
+    try:
+        (BASE_DIR / ".aguardar_pid").write_text(str(os.getpid()))
+    except Exception:
+        pass
+    try:
+        subprocess.Popen(["explorer.exe", str(exe_atual)], close_fds=True)
+        _registrar_troca("versao nova aberta pelo Explorer")
+    except Exception as e:
+        _registrar_troca(f"FALHA ao abrir pelo Explorer ({e}); o atalho de inicializacao abre no proximo boot")
 
+    if tag != "teste":
+        CONFIG["ultima_tag_instalada"] = tag
+        _gravar_config()
     logger.info(f"[UPDATE] Reiniciando na versao {tag}...")
     return True
+
+
+def _limpar_executaveis_antigos() -> None:
+    for p in BASE_DIR.glob("*.antigo*.exe"):
+        try:
+            p.unlink()
+            _registrar_troca(f"versao anterior apagada: {p.name}")
+        except Exception:
+            pass   # ainda em uso: tenta no proximo inicio
 
 
 logger.info(f"Agente de Varredura v{VERSAO} — maquina {MACHINE_ID}")
@@ -726,6 +726,26 @@ def _adquirir_lock():
     Compara o NOME do executável do PID gravado no lock com o nosso: se bate, há
     uma instância viva de verdade e esta sai. PIDs são reutilizados depois de um
     reboot, então só checar se o PID existe não basta."""
+    # 1.1.12: aberta pela troca de versao? Espera a versao anterior terminar de sair
+    # (ela grava .aguardar_pid antes de pedir ao Explorer para abrir esta).
+    marca = BASE_DIR / ".aguardar_pid"
+    if marca.exists():
+        try:
+            pid_velho = int(marca.read_text().strip())
+        except (ValueError, OSError):
+            pid_velho = None
+        if pid_velho and pid_velho != os.getpid():
+            for _ in range(60):
+                if _nome_do_processo(pid_velho) is None:
+                    break
+                time.sleep(1)
+            logger.info(f"Versao anterior (PID {pid_velho}) encerrou; assumindo")
+            _registrar_troca(f"versao {VERSAO} iniciou (PID {os.getpid()}) apos a anterior sair")
+        try:
+            marca.unlink()
+        except OSError:
+            pass
+
     if _LOCK_FILE.exists():
         try:
             pid_antigo = int(_LOCK_FILE.read_text().strip())
@@ -752,6 +772,7 @@ def _adquirir_lock():
 # que esteja rodando de verdade.
 if "--diagnostico" not in sys.argv and "/diagnostico" not in sys.argv:
     _adquirir_lock()
+    _limpar_executaveis_antigos()
 
 if verificar_atualizacao():
     sys.exit(0)
