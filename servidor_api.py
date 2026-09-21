@@ -211,7 +211,7 @@ def criar_app(supabase_client, config):
             "timestamp": datetime.now().isoformat(),
             # O RNX pergunta isto antes de mostrar "Consultar na Receita":
             # agente antigo nao tem a rota e o botao nao pode prometer o que nao ha.
-            "recursos": ["explorador", "receita_cnpj", "situacao_fiscal", "carteira"],
+            "recursos": ["explorador", "receita_cnpj", "situacao_fiscal", "carteira", "guia"],
             "versao": VERSAO_AGENTE,
             "usuario": config.get("user_nome") or config.get("user_email"),
             "usuario_id": config.get("user_id"),
@@ -287,6 +287,73 @@ def criar_app(supabase_client, config):
         clientes.sort(key=lambda x: x["nome"])
         return {"usuario": config.get("user_nome") or config.get("user_email"),
                 "carteira": bool(ids), "total": len(clientes), "clientes": clientes}
+
+    # ----------------------------------------------------------
+    # POST /api/guia   (21/09/2026)
+    # O modulo de guias de antecipacao ICMS (Central) avisa aqui cada guia EMITIDA.
+    # O agente sobe o PDF e o RNX cria a tarefa "GUIA ANTECIPACAO ICMS" ja realizada
+    # e com "guia nao enviada" (rnx_registrar_guia_central). Cliente de outra carteira
+    # vai para a triagem do dono. Nao ha tarefa mensal: a cobranca e a DeSTDA.
+    # ----------------------------------------------------------
+    def _subir_pdf_guia(caminho: Path, cnpj: str, competencia: str) -> str:
+        bucket = config.get("bucket_storage", "documentos-clientes")
+        prefixo = config.get("storage_path_prefix", "pdfs")
+        comp = re.sub(r"\D", "", competencia or "")
+        cnpj_dig = re.sub(r"\D", "", cnpj or "")
+        nome = f"guias/ga379_{cnpj_dig}_{comp}_{int(time.time())}.pdf"
+        with open(caminho, "rb") as f:
+            supabase_client.storage.from_(bucket).upload(
+                f"{prefixo}/{nome}", f.read(),
+                file_options={"cache-control": "3600", "upsert": "true", "content-type": "application/pdf"})
+        return supabase_client.storage.from_(bucket).get_public_url(f"{prefixo}/{nome}")
+
+    def _uma_guia(g: dict) -> dict:
+        base = {k: g.get(k) for k in ("cnpj", "competencia", "valor", "vencimento", "arquivo")}
+        try:
+            v = supabase_client.rpc("rnx_registrar_guia_central", {"p": dict(base, verificar=True)}).execute().data or {}
+        except Exception as e:
+            return {"ok": False, "cnpj": base.get("cnpj"), "motivo": str(e)[:200]}
+        outra = (not v.get("ok")) and v.get("motivo") == "outra carteira"
+        if not v.get("ok") and not outra:
+            return dict(v, cnpj=base.get("cnpj"))
+
+        arquivo = Path(str(base.get("arquivo") or ""))
+        if arquivo.suffix.lower() != ".pdf" or not arquivo.is_file():
+            return {"ok": False, "cnpj": base.get("cnpj"), "motivo": f"PDF da guia nao encontrado: {arquivo}"}
+        try:
+            pdf_url = _subir_pdf_guia(arquivo, base.get("cnpj"), base.get("competencia"))
+            if outra:
+                comp = str(base.get("competencia") or "")
+                if re.match(r"^\d{2}/\d{4}$", comp):
+                    comp = comp[3:] + "-" + comp[:2]
+                r = supabase_client.rpc("rnx_encaminhar_triagem_outra_carteira", {"p": {
+                    "cnpj": base.get("cnpj"), "nome_arquivo": arquivo.name, "tipo_guia": "GA 379",
+                    "competencia": comp, "valor": base.get("valor"), "pdf_url": pdf_url,
+                    "texto_extraido": "Guia de antecipacao ICMS (GA 379) emitida pela Central."}}).execute().data or {}
+                return dict(r, cnpj=base.get("cnpj"), triagem=True)
+            r = supabase_client.rpc("rnx_registrar_guia_central", {"p": dict(base, pdf_url=pdf_url)}).execute().data or {}
+            return dict(r, cnpj=base.get("cnpj"))
+        except Exception as e:
+            return {"ok": False, "cnpj": base.get("cnpj"), "motivo": str(e)[:200]}
+
+    @app.post("/api/guia")
+    def api_guia(corpo: dict = Body(...), x_rnx_local: str | None = Header(default=None)):
+        if x_rnx_local != "1":
+            raise HTTPException(403, "Cabecalho X-RNX-Local ausente")
+        guias = corpo.get("guias")
+        if not isinstance(guias, list) or not guias:
+            raise HTTPException(400, "Envie {\"guias\": [...]}")
+        if len(guias) > 100:
+            raise HTTPException(413, "No maximo 100 guias por envio")
+        resultados = [_uma_guia(g) for g in guias if isinstance(g, dict)]
+        logger.info(f"[GUIA] {len(resultados)} guia(s) recebida(s) da Central: "
+                    + "; ".join(f"{r.get('cliente') or r.get('cnpj')}: "
+                                + ("triagem de " + str(r.get('dono')) if r.get('triagem') else
+                                   ("tarefa " + str(r.get('tarefa')) if r.get('ok') else str(r.get('motivo'))))
+                                for r in resultados))
+        return {"resultados": resultados,
+                "ok": sum(1 for r in resultados if r.get("ok")),
+                "falhas": sum(1 for r in resultados if not r.get("ok"))}
 
     # def (nao async): o FastAPI roda numa thread e as gravacoes nao travam as outras rotas
     @app.post("/api/fiscal/situacao")
