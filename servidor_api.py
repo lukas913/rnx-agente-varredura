@@ -211,7 +211,7 @@ def criar_app(supabase_client, config):
             "timestamp": datetime.now().isoformat(),
             # O RNX pergunta isto antes de mostrar "Consultar na Receita":
             # agente antigo nao tem a rota e o botao nao pode prometer o que nao ha.
-            "recursos": ["explorador", "receita_cnpj", "situacao_fiscal"],
+            "recursos": ["explorador", "receita_cnpj", "situacao_fiscal", "carteira"],
             "versao": VERSAO_AGENTE,
             "usuario": config.get("user_nome") or config.get("user_email"),
             "usuario_id": config.get("user_id"),
@@ -232,6 +232,61 @@ def criar_app(supabase_client, config):
     _CAMPOS_FISCAIS = ("cnpj", "empresa", "consultadoEm", "risco", "totalDebitos", "quantidadeDebitos",
                        "totalSuspenso", "quantidadeSuspensos", "inscricoesPgfn", "simples", "certidao",
                        "problemas", "arquivo", "origem", "versaoAnalise")
+
+    # ----------------------------------------------------------
+    # GET /api/carteira   (21/09/2026)
+    # A Central de Automacoes le daqui a lista de clientes (antes vinha de uma
+    # planilha Excel atualizada a mao). Sao os clientes ATIVOS da carteira de quem
+    # esta logado no agente; sem vinculo nenhum, os que o RNX deixar ver.
+    # ----------------------------------------------------------
+    def _primeiro(c, *campos):
+        for k in campos:
+            v = c.get(k)
+            if v not in (None, ""):
+                return str(v).strip()
+        return ""
+
+    @app.get("/api/carteira")
+    def api_carteira(x_rnx_local: str | None = Header(default=None)):
+        if x_rnx_local != "1":
+            raise HTTPException(403, "Cabecalho X-RNX-Local ausente")
+        uid = config.get("user_id")
+        try:
+            ids = []
+            if uid:
+                v = supabase_client.table("usuario_clientes").select("cliente_id").eq("usuario_id", uid).execute()
+                ids = [r["cliente_id"] for r in (v.data or []) if r.get("cliente_id")]
+            linhas = []
+            if ids:
+                for i in range(0, len(ids), 200):
+                    r = supabase_client.table("clientes").select("*").in_("id", ids[i:i + 200]).execute()
+                    linhas += r.data or []
+            else:
+                linhas = supabase_client.table("clientes").select("*").execute().data or []
+        except Exception as e:
+            raise HTTPException(502, f"Nao consegui ler a carteira no RNX: {str(e)[:200]}")
+
+        clientes = []
+        for c in linhas:
+            status = _primeiro(c, "status") or "ATIVO"
+            if "inativ" in status.lower():
+                continue
+            cnpj = re.sub(r"\D", "", c.get("cnpj") or "")
+            if len(cnpj) != 14:
+                continue
+            clientes.append({
+                "nome": _primeiro(c, "razaoSocial", "nomeFantasia"),
+                "cnpj": cnpj,
+                "regime": _primeiro(c, "regimeTributario", "regime"),
+                "cidade": _primeiro(c, "cidade", "municipio"),
+                "uf": _primeiro(c, "uf", "estado"),
+                "status": status.upper(),
+                "whatsapp": re.sub(r"\D", "", _primeiro(c, "whatsapp", "celular", "telefone")),
+                "rnx_id": c.get("id"),
+            })
+        clientes.sort(key=lambda x: x["nome"])
+        return {"usuario": config.get("user_nome") or config.get("user_email"),
+                "carteira": bool(ids), "total": len(clientes), "clientes": clientes}
 
     # def (nao async): o FastAPI roda numa thread e as gravacoes nao travam as outras rotas
     @app.post("/api/fiscal/situacao")
