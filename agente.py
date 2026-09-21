@@ -78,7 +78,7 @@ def _novo_cliente(url: str, key: str):
 # Precisa ser bumpada a cada release publicada no GitHub. E ela que o
 # auto-update compara com a tag da release mais recente.
 # ============================================================
-VERSAO = "1.1.9"
+VERSAO = "1.1.10"
 REPO_API_LATEST = "https://api.github.com/repos/lukas913/rnx-agente-varredura/releases/latest"
 NOME_ASSET = "AgenteVarredura.exe"
 
@@ -620,6 +620,17 @@ def verificar_atualizacao():
         f'echo [%date% %time%] executavel substituido apos %tentativas% tentativa(s) >> "{log_troca}"\r\n'
         f'start "" "{exe_atual}"\r\n'
         f'echo [%date% %time%] agente reiniciado >> "{log_troca}"\r\n'
+        # 1.1.10: na troca 1.1.8 -> 1.1.9 (18/09) o "start" disparou e o agente novo
+        # nao ficou de pe. Confere depois de ~25 s e tenta de novo, com rastro.
+        "ping -n 26 127.0.0.1 >nul\r\n"
+        'tasklist /fi "imagename eq AgenteVarredura.exe" /nh | find /i "AgenteVarredura.exe" >nul\r\n'
+        "if not errorlevel 1 goto confirmado\r\n"
+        f'echo [%date% %time%] agente novo nao estava rodando: abrindo de novo >> "{log_troca}"\r\n'
+        f'start "" "{exe_atual}"\r\n'
+        "goto fim\r\n"
+        ":confirmado\r\n"
+        f'echo [%date% %time%] conferido: agente em execucao >> "{log_troca}"\r\n'
+        ":fim\r\n"
         'del "%~f0"\r\n'
         "exit /b\r\n"
         ":desistiu\r\n"
@@ -2807,8 +2818,9 @@ def _processar_arquivo(caminho_pdf: Path) -> None:
         # 2. Validações mínimas
         # 2b. Check de permissão: este CNPJ pertence aos clientes deste usuário?
         if dados["cnpj"] and not _cnpj_permitido(dados["cnpj"]):
-            logger.info(f"   CNPJ {dados['cnpj']} não pertence a este usuário — ignorando")
-            return
+            logger.info(f"   CNPJ {dados['cnpj']} não é da sua carteira — procurando o dono")
+            if _encaminhar_outra_carteira(caminho_pdf, dados) != "meu":
+                return
 
         # 3. Buscar cliente
         razao_social = None
@@ -3189,6 +3201,77 @@ def _arquivar_triagem_resolvidos() -> None:
         _marcar_triagem_arquivada(rid)
 
 
+def _subir_pdf_triagem(arquivo: Path, nome_sem_ext: str) -> str:
+    """Sobe o PDF para o Storage (pasta triagem) e devolve a URL publica."""
+    ts = int(time.time())
+    storage_name = f"triagem_{ts}_{nome_sem_ext}"
+    storage_name = unicodedata.normalize("NFKD", storage_name).encode("ascii", "ignore").decode("ascii")
+    storage_name = re.sub(r"[^\w_-]", "", storage_name) + ".pdf"
+    storage_path = f"{CONFIG['storage_path_prefix']}/triagem/{storage_name}"
+    with open(arquivo, "rb") as f:
+        supabase.storage.from_(CONFIG["bucket_storage"]).upload(
+            storage_path, f.read(),
+            file_options={"cache-control": "3600", "upsert": "true", "content-type": "application/pdf"},
+        )
+    return supabase.storage.from_(CONFIG["bucket_storage"]).get_public_url(storage_path)
+
+
+def _valor_numerico(valor):
+    if valor is None:
+        return None
+    try:
+        return float(str(valor).replace(",", ".").replace("R$", "").strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def _encaminhar_outra_carteira(caminho: Path, dados: dict) -> str:
+    """Documento de cliente de OUTRA carteira (1.1.10, 21/09/2026).
+
+    Antes: "nao pertence a este usuario — ignorando", e o rescan relia o arquivo a
+    cada 30 s para sempre; ninguem dava baixa (caso QUESOL depois da transferencia
+    Lucas -> Ana). Agora vai para a TRIAGEM do dono da carteira, com o PDF e o aviso
+    de quem salvou. Quem salvou nao da baixa em tarefa alheia (isolamento).
+
+    Devolve: 'encaminhado' | 'meu' (a carteira mudou: seguir o fluxo normal) | 'falhou'."""
+    nome = caminho.name
+    base = {
+        "cnpj": dados.get("cnpj"), "nome_arquivo": _nome_base(nome),
+        "tipo_guia": dados.get("tipo_guia"), "competencia": dados.get("competencia"),
+    }
+    try:
+        r = supabase.rpc("rnx_encaminhar_triagem_outra_carteira", {"p": dict(base, verificar=True)}).execute().data or {}
+        motivo = r.get("motivo") or ""
+        if not r.get("ok"):
+            if "sua carteira" in motivo:
+                _carregar_cnpjs_usuario()   # a carteira mudou desde que o agente abriu
+                return "meu"
+            logger.info(f"   Outra carteira: nao encaminhado ({motivo})")
+            _copiar_para_erro(caminho, f"Nao e da sua carteira e nao deu para entregar ao dono: {motivo}", dados)
+            return "falhou"
+        if not r.get("repetido"):
+            pdf_url = _subir_pdf_triagem(caminho, Path(_nome_base(nome)).stem[:120])
+            r = supabase.rpc("rnx_encaminhar_triagem_outra_carteira", {"p": dict(
+                base, pdf_url=pdf_url, valor=_valor_numerico(dados.get("valor")),
+                sem_movimento=bool(dados.get("sem_movimento")),
+                texto_extraido=(dados.get("texto_completo") or "")[:3000])}).execute().data or {}
+            if not r.get("ok"):
+                raise RuntimeError(r.get("motivo") or "resposta sem ok")
+        logger.info(f"   Cliente da carteira de {r.get('dono')} — enviado para a triagem dela(e)"
+                    + (" (ja estava la)" if r.get("repetido") else ""))
+        _arquivos_processados.add(nome)
+        _arquivos_processados.add(_nome_base(nome))
+        # Fica no log do banco: depois de reiniciar, o agente nao encaminha de novo
+        _registrar_log_processamento(cliente=r.get("cliente"), tipo_guia=dados.get("tipo_guia"),
+                                     competencia=dados.get("competencia"), arquivo=nome,
+                                     status="encaminhado_outra_carteira")
+        return "encaminhado"
+    except Exception as e:
+        logger.warning(f"   Falha ao encaminhar para a outra carteira (tenta de novo depois): {e}")
+        _proxima_tentativa[_nome_base(nome)] = time.time() + 600
+        return "falhou"
+
+
 def _copiar_para_erro(caminho: Path, motivo: str, dados: dict | None = None) -> None:
     """Move o PDF para _erro e envia para fila de triagem no Supabase."""
     try:
@@ -3227,27 +3310,8 @@ def _copiar_para_erro(caminho: Path, motivo: str, dados: dict | None = None) -> 
         # === FILA DE TRIAGEM: upload PDF + insert no Supabase ===
         try:
             _dados = dados or {}
-            # Upload do PDF para Storage
-            ts = int(time.time())
-            storage_name = f"triagem_{ts}_{nome_sem_ext}"
-            storage_name = unicodedata.normalize("NFKD", storage_name).encode("ascii", "ignore").decode("ascii")
-            storage_name = re.sub(r"[^\w_-]", "", storage_name) + ".pdf"
-            storage_path = f"{CONFIG['storage_path_prefix']}/triagem/{storage_name}"
-
-            with open(destino, "rb") as f:
-                supabase.storage.from_(CONFIG["bucket_storage"]).upload(
-                    storage_path, f.read(),
-                    file_options={"cache-control": "3600", "upsert": "true", "content-type": "application/pdf"},
-                )
-            pdf_url = supabase.storage.from_(CONFIG["bucket_storage"]).get_public_url(storage_path)
-
-            # Converte valor para float se necessário
-            valor_num = None
-            if _dados.get("valor") is not None:
-                try:
-                    valor_num = float(str(_dados["valor"]).replace(",", ".").replace("R$", "").strip())
-                except (ValueError, TypeError):
-                    pass
+            pdf_url = _subir_pdf_triagem(destino, nome_sem_ext)
+            valor_num = _valor_numerico(_dados.get("valor"))
 
             supabase.table("triagem_documentos").insert({
                 "user_id": USER_ID,
