@@ -211,7 +211,7 @@ def criar_app(supabase_client, config):
             "timestamp": datetime.now().isoformat(),
             # O RNX pergunta isto antes de mostrar "Consultar na Receita":
             # agente antigo nao tem a rota e o botao nao pode prometer o que nao ha.
-            "recursos": ["explorador", "receita_cnpj", "situacao_fiscal", "carteira", "guia"],
+            "recursos": ["explorador", "receita_cnpj", "situacao_fiscal", "carteira", "guia", "envios"],
             "versao": VERSAO_AGENTE,
             "usuario": config.get("user_nome") or config.get("user_email"),
             "usuario_id": config.get("user_id"),
@@ -354,6 +354,43 @@ def criar_app(supabase_client, config):
         return {"resultados": resultados,
                 "ok": sum(1 for r in resultados if r.get("ok")),
                 "falhas": sum(1 for r in resultados if not r.get("ok"))}
+
+    # ----------------------------------------------------------
+    # POST /api/envios  e  POST /api/envios/{id}   (21/09/2026)
+    # A ponte de WhatsApp da Central registra cada envio no rastreamento do RNX
+    # (envios_log) ANTES de mandar, e conclui depois. Antes ela fazia login no RNX
+    # com e-mail e SENHA lidos do config.json do agente; agora usa a sessao do agente.
+    # ----------------------------------------------------------
+    _CAMPOS_ENVIO = ("id", "cliente_id", "cliente_nome", "destinatario_numero", "canal", "tipo", "assunto",
+                     "mensagem", "evento_id", "pdf_url", "pdf_nome", "usuario_nome", "status", "enviado_em")
+    _CAMPOS_CONCLUSAO = ("status", "wpp_message_id", "erro_mensagem")
+
+    @app.post("/api/envios")
+    def api_envio_registrar(corpo: dict = Body(...), x_rnx_local: str | None = Header(default=None)):
+        if x_rnx_local != "1":
+            raise HTTPException(403, "Cabecalho X-RNX-Local ausente")
+        linha = {k: corpo[k] for k in _CAMPOS_ENVIO if k in corpo}
+        if not linha.get("cliente_id") or not linha.get("mensagem"):
+            raise HTTPException(400, "cliente_id e mensagem sao obrigatorios")
+        linha["usuario_id"] = config.get("user_id")
+        try:
+            supabase_client.table("envios_log").insert(linha).execute()
+        except Exception as e:
+            raise HTTPException(502, f"Nao consegui registrar o envio no RNX: {str(e)[:200]}")
+        return {"ok": True, "id": linha.get("id")}
+
+    @app.post("/api/envios/{envio_id}")
+    def api_envio_concluir(envio_id: str, corpo: dict = Body(...), x_rnx_local: str | None = Header(default=None)):
+        if x_rnx_local != "1":
+            raise HTTPException(403, "Cabecalho X-RNX-Local ausente")
+        campos = {k: corpo[k] for k in _CAMPOS_CONCLUSAO if k in corpo}
+        if not campos:
+            raise HTTPException(400, "Nada para atualizar")
+        try:
+            supabase_client.table("envios_log").update(campos).eq("id", envio_id).execute()
+        except Exception as e:
+            raise HTTPException(502, f"Nao consegui concluir o envio no RNX: {str(e)[:200]}")
+        return {"ok": True}
 
     # def (nao async): o FastAPI roda numa thread e as gravacoes nao travam as outras rotas
     @app.post("/api/fiscal/situacao")
