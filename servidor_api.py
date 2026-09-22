@@ -392,6 +392,30 @@ def criar_app(supabase_client, config):
             raise HTTPException(502, f"Nao consegui concluir o envio no RNX: {str(e)[:200]}")
         return {"ok": True}
 
+    # 1.1.15 (22/09/2026): o PDF da consulta so existia no servidor do escritorio e o site
+    # nao abre caminho de rede. Sobe para o armazenamento e anexa na consulta (aba
+    # "Situacao fiscal" da ficha do cliente). Falha aqui nunca derruba o registro.
+    def _anexar_pdf_consulta(resultado, registro: dict):
+        if not isinstance(resultado, dict) or not resultado.get("consulta") or resultado.get("repetida"):
+            return
+        arquivo = Path(str(registro.get("arquivo") or ""))
+        if arquivo.suffix.lower() != ".pdf" or not arquivo.is_file():
+            return
+        try:
+            bucket = config.get("bucket_storage", "documentos-clientes")
+            prefixo = config.get("storage_path_prefix", "pdfs")
+            cnpj = re.sub(r"\D", "", str(registro.get("cnpj") or ""))
+            nome = f"{prefixo}/situacao-fiscal/{cnpj}_{resultado['consulta']}_{int(time.time())}.pdf"
+            with open(arquivo, "rb") as f:
+                supabase_client.storage.from_(bucket).upload(
+                    nome, f.read(),
+                    file_options={"cache-control": "3600", "upsert": "true", "content-type": "application/pdf"})
+            url = supabase_client.storage.from_(bucket).get_public_url(nome)
+            supabase_client.rpc("rnx_anexar_pdf_consulta",
+                                {"p_consulta": resultado["consulta"], "p_url": url}).execute()
+        except Exception as e:
+            logger.warning(f"[FISCAL] PDF da consulta {resultado.get('consulta')} nao subiu: {str(e)[:200]}")
+
     # def (nao async): o FastAPI roda numa thread e as gravacoes nao travam as outras rotas
     @app.post("/api/fiscal/situacao")
     def api_fiscal_situacao(corpo: dict = Body(...), x_rnx_local: str | None = Header(default=None)):
@@ -423,6 +447,7 @@ def criar_app(supabase_client, config):
                 r = supabase_client.rpc("rnx_registrar_situacao_fiscal",
                                         {"p": registro, "p_gerar_tarefas": gerar}).execute()
                 resultados.append(r.data)
+                _anexar_pdf_consulta(r.data, registro)
             except Exception as e:
                 resultados.append({"ok": False, "cnpj": registro.get("cnpj"), "motivo": str(e)[:200]})
         tarefas = sorted({r.get("tarefa") for r in resultados if isinstance(r, dict) and r.get("tarefa")})
